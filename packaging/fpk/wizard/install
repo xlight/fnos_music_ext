@@ -9,7 +9,7 @@
             {
                 "type": "radio",
                 "field": "wizard_sources",
-                "label": "初始音源（四选一）",
+                "label": "初始音源（五选一）",
                 "initValue": "musicdl",
                 "options": [
                     {
@@ -27,6 +27,10 @@
                     {
                         "label": "neteasefree — 网易云·免扫码（第三方后端，默认关闭；后端地址装后在管理台确认，仅支持 https）",
                         "value": "neteasefree"
+                    },
+                    {
+                        "label": "qqmusic — QQ 音乐（默认关闭；安装后在管理页扫码或粘贴 Cookie 登录，未登录为 128k 免费档）",
+                        "value": "qqmusic"
                     }
                 ],
                 "rules": [

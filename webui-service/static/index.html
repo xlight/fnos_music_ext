@@ -60,7 +60,7 @@
             <!-- 音乐源（收敛：播放与推荐、搜索、lx 并入） -->
       <section class="page" id="page-source">
 
-        <h2><span>音乐源（四选一）</span><button class="help-btn" type="button" data-help="providers" aria-label="音乐源帮助">?</button></h2>
+        <h2><span>音乐源（五选一）</span><button class="help-btn" type="button" data-help="providers" aria-label="音乐源帮助">?</button></h2>
         <div class="provider-grid">
           <label class="provider-card" data-provider="musicbox">
             <input type="radio" name="provider" value="musicbox">
@@ -81,6 +81,11 @@
             <input type="radio" name="provider" value="lxmusic">
             <div class="provider-head">洛雪自定义源</div>
             <div class="provider-desc">粘贴洛雪自定义源脚本 URL，播放解析全走用户源</div>
+          </label>
+          <label class="provider-card" data-provider="qqmusic">
+            <input type="radio" name="provider" value="qqmusic">
+            <div class="provider-head">QQ 音乐</div>
+            <div class="provider-desc">默认关闭；扫码或粘贴 Cookie 登录，未登录为 128k 免费档</div>
           </label>
         </div>
 
@@ -115,6 +120,49 @@
               <input class="input" id="neteasefree-api-base" placeholder="https://zm.wwoyun.cn">
             </label>
             <p class="hint">默认关闭；默认地址仅为示例占位，启用须显式确认第三方风险；只允许 https 地址。</p>
+          </div>
+        </div>
+
+        <!-- qqmusic：扫码 / Cookie 登录（本轮最小入口） -->
+        <div class="subpanel" id="panel-qqmusic" hidden>
+          <div class="card">
+            <div class="card-title"><span>QQ 音乐登录</span><button class="help-btn" type="button" data-help="qqmusic-login" aria-label="QQ 音乐登录帮助">?</button></div>
+            <div class="qr-area">
+              <img id="qq-qr-img" alt="QQ 音乐登录二维码" hidden>
+              <div id="qq-qr-status" class="muted">点击下方按钮生成二维码</div>
+            </div>
+            <div class="btn-row">
+              <button class="btn" id="qq-qr-btn">生成二维码</button>
+              <button class="btn" id="qq-logout-btn">退出登录</button>
+              <span id="qq-login-check" class="muted"></span>
+            </div>
+            <p class="hint" id="qq-tier-hint">未登录时为免费档位（128k）；登录后可提升音质。</p>
+          </div>
+          <div class="card">
+            <div class="card-title">Cookie 登录（扫码不可用时兜底）</div>
+            <label class="field"><span>粘贴浏览器 Cookie（需包含 uin 与 qm_keyst 或 qqmusic_key）</span>
+              <input class="input" id="qq-cookie" placeholder="uin=...; qm_keyst=..." autocomplete="off">
+            </label>
+            <div class="btn-row">
+              <button class="btn" id="qq-cookie-btn">提交 Cookie</button>
+              <span id="qq-cookie-check" class="muted"></span>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title">音质与搜索</div>
+            <label class="field"><span>QQ 音质档位</span>
+              <select class="input" id="qq-quality">
+                <option value="hires">hires（Hi-Res）</option>
+                <option value="lossless">lossless（无损）</option>
+                <option value="exhigh">exhigh（320k）</option>
+                <option value="higher">higher（192k）</option>
+                <option value="standard">standard（128k）</option>
+              </select>
+            </label>
+            <label class="field"><span>搜索单页条数（1-100）</span>
+              <input class="input" id="qq-search-limit" type="number" min="1" max="100" value="20">
+            </label>
+            <p class="hint">高音质无权限时自动降档到可播档位，不会直接报错。</p>
           </div>
         </div>
 
@@ -602,7 +650,12 @@
   </div>
 
   <template data-help-id="providers">
-    <p>主音源三选一：保存后 WebUI 会切换对应音源进程。musicdl 面向多平台聚合，网易盒子适合账号曲库与每日推荐，洛雪使用你自己的源脚本解析播放。</p>
+    <p>主音源五选一：保存后 WebUI 会切换对应音源进程。musicdl 面向多平台聚合，网易盒子适合账号曲库与每日推荐，洛雪使用你自己的源脚本解析播放，QQ 音乐需扫码或 Cookie 登录。</p>
+  </template>
+  <template data-help-id="qqmusic-login">
+    <p>扫码登录：点击“生成二维码”后用手机 QQ 音乐 App 扫码授权；二维码过期或拒绝授权时页面会提示，重新生成即可。登录态保存在数据卷，重启不丢失。</p>
+    <p>Cookie 登录：从浏览器开发者工具取 QQ 音乐 Cookie，需包含 uin 与 qm_keyst（或 qqmusic_key），粘贴后提交。校验不通过时不会覆盖已有登录态，并会提示原因。</p>
+    <p>未登录时可播免费档位（128k）；登录后可提升音质。付费曲目未登录时仅标记为 VIP 曲目。</p>
   </template>
   <template data-help-id="netease-login">
     <p>手机网易云音乐 App 扫码授权。登录态保存在数据卷，重启不丢失。</p>

@@ -204,15 +204,17 @@ def test_common_repo_dir_precedence(sb):
 
 
 def test_common_saved_source_priority(sb):
-    """.env 四布尔→--sources：musicbox > neteasefree > lxmusic > musicdl，未配置为空。"""
+    """.env 五布尔→--sources：musicbox > neteasefree > qqmusic > lxmusic > musicdl，未配置为空。"""
     cases = [
         ("FNMUSIC_NETEASE_ENABLED=true\n", "musicbox"),
         ("FNMUSIC_NETEASEFREE_ENABLED=true\n", "neteasefree"),
+        ("FNMUSIC_QQMUSIC_ENABLED=true\n", "qqmusic"),
         ("FNMUSIC_LX_ENABLED=true\n", "lxmusic"),
         ("FNMUSIC_MUSICDL_ENABLED=true\n", "musicdl"),
-        # 四者并存取最高优先级，避免升级后源漂移
+        # 多者并存取最高优先级，避免升级后源漂移
         ("FNMUSIC_NETEASE_ENABLED=true\nFNMUSIC_NETEASEFREE_ENABLED=true\nFNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=true\n", "musicbox"),
-        ("FNMUSIC_NETEASEFREE_ENABLED=true\nFNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=true\n", "neteasefree"),
+        ("FNMUSIC_NETEASEFREE_ENABLED=true\nFNMUSIC_QQMUSIC_ENABLED=true\nFNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=true\n", "neteasefree"),
+        ("FNMUSIC_QQMUSIC_ENABLED=true\nFNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=true\n", "qqmusic"),
         ("FNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=true\n", "lxmusic"),
         ("FNMUSIC_MUSICDL_ENABLED=false\n", ""),
         ("", ""),
@@ -358,6 +360,14 @@ def test_install_callback_accepts_neteasefree(sb):
     result = sb.run("install_callback", wizard_sources="neteasefree", wizard_extend="true")
     assert result.returncode == 0, result.stderr
     assert sb.install_args() == ["--non-interactive --sources neteasefree --webui --adopt --extend"]
+
+
+def test_install_callback_accepts_qqmusic(sb):
+    """第五源向导值同样透传；登录凭证在数据卷，无需额外参数。"""
+    sb.make_repo()
+    result = sb.run("install_callback", wizard_sources="qqmusic", wizard_extend="true")
+    assert result.returncode == 0, result.stderr
+    assert sb.install_args() == ["--non-interactive --sources qqmusic --webui --adopt --extend"]
 
 
 def test_install_callback_lx_without_url_installs_sourceless(sb):

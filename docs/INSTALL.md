@@ -42,6 +42,7 @@ v2.8.0 起支持两种音源部署形态（`.env` 的 `FNMUSIC_DEPLOY_MODE`）�
 | 8770 | 127.0.0.1 | musicbox 音源（仅本机；扫码走已登录的管理页） |
 | 8772 | 127.0.0.1 | lxmusic 音源（仅代理访问） |
 | 8776 | 127.0.0.1 | neteasefree 免扫码音源（容器内 8006，仅代理访问；默认关闭，第三方后端） |
+| 8775 | 127.0.0.1 | qqmusic QQ 音乐音源（容器内 8007，仅代理访问；默认关闭） |
 | 8774 | 127.0.0.1 | 管理 WebUI（仅本机；浏览器走飞牛网关，仅管理员） |
 
 数据卷：项目目录 `sources-data/`（网易登录态、洛雪源脚本缓存与状态）；仓库目录挂载到容器 `/repo`（WebUI 读写 `.env` 用）。容器无特权、不挂 docker.sock。
@@ -54,7 +55,7 @@ v2.8.0 起支持两种音源部署形态（`.env` 的 `FNMUSIC_DEPLOY_MODE`）�
 
 从 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`，在 fnOS「应用中心 → 手动安装」选择该文件：
 
-1. 向导中选择**初始音源**（musicdl / musicbox / lxmusic / neteasefree，选 lxmusic 装后在管理页配置源脚本；neteasefree 为免扫码第四源，默认关闭，后端地址装后在管理页确认）；
+1. 向导中选择**初始音源**（musicdl / musicbox / lxmusic / neteasefree / qqmusic，选 lxmusic 装后在管理页配置源脚本；neteasefree 为免扫码第四源、qqmusic 为 QQ 音乐第五源，均默认关闭）；
 2. 保持「安装完成后立即启用扩展」开启，安装即自动完成容器构建、代理接管与全链路验收；
 3. 桌面出现「fnMusic 扩展管理」图标，用飞牛管理员点击打开管理页（`/app/fnmusic-ext`）。
 
@@ -82,11 +83,12 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 
 向导自动执行环境预检，依次引导：
 
-1. **音源四选一**（v2.0.0 起互斥单选，默认仍为 musicdl；v2.12.0-4 起新增第四源）：
+1. **音源五选一**（v2.0.0 起互斥单选，默认仍为 musicdl；v2.12.0-4 起新增第四源，本轮新增第五源）：
    - `1` 网易云 musicbox：安装后自动进入扫码登录；
    - `2` musicdl：进入平台多选子菜单（默认精选酷我+咪咕；全部平台编号见 [../musicdl-service/PLATFORMS.md](../musicdl-service/PLATFORMS.md)）；
    - `3` 洛雪 lxmusic：直接安装（无源状态），源脚本装好在管理页 WebUI 配置；也可在安装命令附 `--lx-source-url`（URL / 本机 `.js` 路径），安装时进行「下载→初始化→搜索→解析→探活」全链路校验；
    - `4` 网易云免扫码 neteasefree（v2.12.0-4 新增，可选第四源，默认关闭）：免扫码搜索播放走第三方后端，`--neteasefree-api-base` 仅透传保留，后端地址须在管理页确认（仅支持 https，默认示例占位须显式确认风险），与网易云歌单常驻互斥；
+   - `5` QQ 音乐 qqmusic（新增，可选第五源，默认关闭）：装后在管理页扫码或粘贴 Cookie 登录，未登录仅免费档位 128k；高音质无权限时自动降档，与网易云歌单常驻互斥，不参与播放直连；
 2. **是否安装管理 WebUI**（仅本机 8774，默认否；打开时走飞牛管理员登录）；
 3. **大模型接口（可选）**：OpenAI 兼容 API；仅保存接口不会启用用途。安装后在管理页明确勾选「大模型用于猜你喜欢 / 每日推荐」，两个用途默认都关闭；
 4. **一键启用**：确认后自动调用 `./extend.sh` 接管验收。
@@ -113,7 +115,7 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
   --llm-api-key '<KEY>' --llm-model 'gpt-4o-mini' --extend
 ```
 
-常用参数：`--sources`（音源四选一，默认 musicdl）、`--neteasefree-api-base`（第四源后端地址透传保留，启用确认与 https 校验在管理页）、`--lx-source-url`（可选：http(s) URL 或
+常用参数：`--sources`（音源五选一，默认 musicdl）、`--neteasefree-api-base`（第四源后端地址透传保留，启用确认与 https 校验在管理页）、`--lx-source-url`（可选：http(s) URL 或
 宿主机 `.js` 路径，路径会自动复制进数据卷）、`--lx-skip-verify`
 （跳过洛雪源可用性校验直接激活，源是否可用装好后在管理页 WebUI 查看）、
 `--webui` / `--no-webui`、`--extend`（安装后自动接管）、`--deploy docker|native`
@@ -308,6 +310,7 @@ curl -s http://127.0.0.1:8768/healthz   # musicdl（若启用）
 curl -s http://127.0.0.1:8770/healthz   # musicbox（若启用）
 curl -s http://127.0.0.1:8772/healthz   # lxmusic（若启用；含 user_source 状态）
 curl -s http://127.0.0.1:8776/healthz   # neteasefree（若启用；第三方后端）
+curl -s http://127.0.0.1:8775/healthz   # qqmusic（若启用；含 logged_in 字段）
 curl -s http://127.0.0.1:8774/healthz   # WebUI（若启用）
 
 # 本地自动化测试集（无需 Docker/飞牛环境）
@@ -398,8 +401,8 @@ v2.0.0 结构变化较大（三容器→单容器、数据目录迁移、配置�
 `git pull` → `./restore.sh`（先还原官方直连并清理旧部署，兼容 v1.x 旧容器/宿主机服务；
 `.env` 与数据保留）→ `./install.sh` 全新安装。直接原地升级同样支持。
 
-v1.x 允许多音源并存，v2.0.0 起音源互斥单选（三选一；2.12.0-4 起扩展为四选一）。升级安装时检测到旧 `.env` 多源
-并存会要求重新四选一（非交互需 `--sources` 指定唯一音源）。此后换源在 WebUI
+v1.x 允许多音源并存，v2.0.0 起音源互斥单选（三选一；2.12.0-4 起扩展为四选一，本轮扩展为五选一）。升级安装时检测到旧 `.env` 多源
+并存会要求重新选择（-须知：非交互需 `--sources` 指定唯一音源）。此后换源在 WebUI
 里秒级完成，不必重装。
 
 ### 洛雪源测试失败

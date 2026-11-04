@@ -3,13 +3,14 @@ set -euo pipefail
 
 # ==============================================================================
 # fnmusic-ext 一键安装 / 配置（v2.0.0：Docker 单容器·按需加载）
-# - 仅支持 Docker 部署：四音源 + WebUI 合并为单容器 fnmusic-sources，
-#   supervisor 管理六个程序，只启动当前所选音源（切源秒级，不重建容器）
-# - 音源四选一（互斥单选，可随时在 WebUI 里切换）：
+# - 仅支持 Docker 部署：五音源 + WebUI 合并为单容器 fnmusic-sources，
+#   supervisor 管理七个程序，只启动当前所选音源（切源秒级，不重建容器）
+# - 音源五选一（互斥单选，可随时在 WebUI 里切换）：
 #     1 musicbox https://github.com/darknessomi/musicbox  (:8770 网易云，推荐扫码登录)
 #     2 musicdl  https://github.com/CharlesPikachu/musicdl (:8768 聚合, 可选平台)
 #     3 lxmusic  洛雪音乐自定义源（用户自带源 URL 解析播放）
 #     4 neteasefree 网易云·免扫码（:8776 第三方后端，需在管理台确认后端地址，默认关闭）
+#     5 qqmusic  QQ 音乐（:8775 扫码/Cookie 登录，未登录为 128k 免费档，默认关闭）
 #   musicdl 平台粒度: --sources musicdl-kuwo,musicdl-migu 或全局编号 --sources 2,4
 #   （全部平台编号见 musicdl-service/PLATFORMS.md）
 # - 管理 Web UI（可选，端口 8774，仅本机；经飞牛登录的管理员打开）：
@@ -89,6 +90,7 @@ ENABLE_MUSICDL=0
 ENABLE_MUSICBOX=0
 ENABLE_NETEASEFREE=0
 ENABLE_LX=0
+ENABLE_QQMUSIC=0
 # 平台粒度（parse_sources 填充）：空 = 未显式选择，沿用 .env 既有值/默认平台
 LX_PLATFORMS=""
 MDL_PLATFORMS=""
@@ -216,7 +218,7 @@ usage() {
     cat <<'EOF'
 用法: ./install.sh [选项]
 
-  --sources LIST         音源四选一（互斥，只能选一个源）：
+  --sources LIST         音源五选一（互斥，只能选一个源）：
                          1) musicbox  网易云音乐盒子（安装后扫码登录）
                          2) musicdl   聚合音源，可精确到平台：
                              --sources musicdl[-<平台短名>,...]
@@ -225,6 +227,8 @@ usage() {
                              URL / 上传 .js / NAS 选择；--lx-source-url 仍可选）
                          4) neteasefree 网易云·免扫码（第三方后端，默认关闭；
                              后端地址在管理台确认，仅支持 https）
+                         5) qqmusic  QQ 音乐（默认关闭；装后在管理页扫码或粘贴
+                             Cookie 登录，未登录为 128k 免费档）
                          示例: --sources musicbox
                                --sources musicdl-kuwo,musicdl-migu
                                --sources lxmusic --lx-source-url https://example.com/lx.js
@@ -436,7 +440,7 @@ apply_source_row() {
 
 print_featured_source_menu() {
     local id provider short full label star
-    echo "精选编号对照（v2.0.0 音源四选一；musicdl 源内可多选平台）:"
+    echo "精选编号对照（v2.0.0 音源五选一；musicdl 源内可多选平台）:"
     while IFS='|' read -r id provider short full label star; do
         [ -z "${id}" ] && continue
         [ "${star}" = "1" ] || continue
@@ -453,10 +457,10 @@ print_featured_source_menu() {
         esac
     done <<< "${SOURCE_PLATFORM_TABLE}"
     echo "完整编号见 musicdl-service/PLATFORMS.md（1=网易云, 2–58 及 64=musicdl, 59–63=lx；53 已退役）。"
-    echo "交互向导请输入 1/2/3/4 四选一；musicdl 平台用 2,4 这类编号，不可与 1 或 59–63 混选。"
+    echo "交互向导请输入 1/2/3/4/5 五选一；musicdl 平台用 2,4 这类编号，不可与 1 或 59–63 混选。"
 }
 
-# musicdl 平台多选子菜单（v2.0.0：音源四选一后，musicdl 源内可继续多选平台）
+# musicdl 平台多选子菜单（v2.0.0：音源五选一后，musicdl 源内可继续多选平台）
 print_featured_mdl_menu() {
     local id provider short full label star
     echo "  精选平台（musicdl 源内可多选，逗号分隔编号）:"
@@ -493,22 +497,24 @@ parse_sources() {
     [ -n "${raw}" ] && [ "${raw}" != "musicdl" ] && explicit=1
 
     if [ "${explicit}" -eq 0 ] && [ -n "${BASE_DIR:-}" ] && [ -f "${env_file}" ]; then
-        local keep_mdl keep_box keep_free keep_lx
+        local keep_mdl keep_box keep_free keep_lx keep_qq
         keep_mdl="$(read_dotenv_value "${env_file}" "FNMUSIC_MUSICDL_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
         keep_box="$(read_dotenv_value "${env_file}" "FNMUSIC_NETEASE_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
         keep_free="$(read_dotenv_value "${env_file}" "FNMUSIC_NETEASEFREE_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
         keep_lx="$(read_dotenv_value "${env_file}" "FNMUSIC_LX_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-        if [ -n "${keep_mdl}${keep_box}${keep_free}${keep_lx}" ]; then
-            ENABLE_MUSICDL=0; ENABLE_MUSICBOX=0; ENABLE_NETEASEFREE=0; ENABLE_LX=0
+        keep_qq="$(read_dotenv_value "${env_file}" "FNMUSIC_QQMUSIC_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+        if [ -n "${keep_mdl}${keep_box}${keep_free}${keep_lx}${keep_qq}" ]; then
+            ENABLE_MUSICDL=0; ENABLE_MUSICBOX=0; ENABLE_NETEASEFREE=0; ENABLE_LX=0; ENABLE_QQMUSIC=0
             case "${keep_mdl}" in true|1|yes|on) ENABLE_MUSICDL=1 ;; esac
             case "${keep_box}" in true|1|yes|on) ENABLE_MUSICBOX=1 ;; esac
             case "${keep_free}" in true|1|yes|on) ENABLE_NETEASEFREE=1 ;; esac
             case "${keep_lx}" in true|1|yes|on) ENABLE_LX=1 ;; esac
+            case "${keep_qq}" in true|1|yes|on) ENABLE_QQMUSIC=1 ;; esac
             KEEP_SOURCES_FROM_ENV=1
             MDL_EXPLICIT=0
             MDL_PLATFORMS=""
             LX_PLATFORMS=""
-            log_info "检测到存量音源配置 (musicdl=${ENABLE_MUSICDL} musicbox=${ENABLE_MUSICBOX} neteasefree=${ENABLE_NETEASEFREE} lx=${ENABLE_LX})，覆盖安装保留现有音源选择"
+            log_info "检测到存量音源配置 (musicdl=${ENABLE_MUSICDL} musicbox=${ENABLE_MUSICBOX} neteasefree=${ENABLE_NETEASEFREE} lx=${ENABLE_LX} qqmusic=${ENABLE_QQMUSIC})，覆盖安装保留现有音源选择"
             return 0
         fi
     fi
@@ -517,6 +523,7 @@ parse_sources() {
     ENABLE_MUSICBOX=0
     ENABLE_NETEASEFREE=0
     ENABLE_LX=0
+    ENABLE_QQMUSIC=0
     LX_PLATFORMS=""
     MDL_PLATFORMS=""
     LX_EXPLICIT=0
@@ -537,13 +544,15 @@ parse_sources() {
                 ENABLE_MUSICBOX=1; picked+=("musicbox") ;;
             neteasefree|netease-free|neteasefree-api|free)
                 ENABLE_NETEASEFREE=1; picked+=("neteasefree") ;;
+            qqmusic|qq|qq-music)
+                ENABLE_QQMUSIC=1; picked+=("qqmusic") ;;
             musicdl|mdl)
                 ENABLE_MUSICDL=1; picked+=("musicdl") ;;
             lx|lxmusic)
                 ENABLE_LX=1; picked+=("lxmusic") ;;
             lx-all|lxmusic-all|lx-*|lxmusic-*)
                 ENABLE_LX=1; picked+=("lxmusic")
-                # lx 平台 token 仅作 LX_SOURCES 显式覆盖（音源仍是四选一里的 lxmusic）
+                # lx 平台 token 仅作 LX_SOURCES 显式覆盖（音源仍是五选一里的 lxmusic）
                 if [ "${part}" = "lx-all" ] || [ "${part}" = "lxmusic-all" ]; then
                     LX_EXPLICIT=1
                     for code in kg wy mg kw; do lx_merge "${code}"; done
@@ -573,7 +582,7 @@ parse_sources() {
                 mdl_merge "${short}" ;;
             *)
                 rec="$(source_lookup_by_id "${part}")" || {
-                    log_err "未知音源: ${part}（可选 musicbox / neteasefree / musicdl[-平台] / lxmusic，或 musicdl-service/PLATFORMS.md 中的平台编号）"
+                    log_err "未知音源: ${part}（可选 musicbox / neteasefree / qqmusic / musicdl[-平台] / lxmusic，或 musicdl-service/PLATFORMS.md 中的平台编号）"
                     exit 1
                 }
                 provider="${rec%% *}"
@@ -588,17 +597,17 @@ parse_sources() {
                 ;;
         esac
     done
-    if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_NETEASEFREE}" -eq 0 ] && [ "${ENABLE_LX}" -eq 0 ]; then
-        log_err "至少选择一个音源（musicbox / neteasefree / musicdl / lxmusic）"
+    if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_NETEASEFREE}" -eq 0 ] && [ "${ENABLE_LX}" -eq 0 ] && [ "${ENABLE_QQMUSIC}" -eq 0 ]; then
+        log_err "至少选择一个音源（musicbox / neteasefree / qqmusic / musicdl / lxmusic）"
         exit 1
     fi
-    # v2.0.0 四源互斥：token 只能映射到一个 provider，跨 provider 直接拒绝
+    # v2.0.0 多源互斥：token 只能映射到一个 provider，跨 provider 直接拒绝
     local unique_providers
     unique_providers="$(printf '%s\n' "${picked[@]}" | sort -u | tr '\n' ' ' | tr -s ' ')"
     local provider_count
     provider_count="$(printf '%s\n' "${picked[@]}" | sort -u | wc -l | tr -d ' ')"
     if [ "${provider_count}" -gt 1 ]; then
-        log_err "音源四选一：检测到同时选择了 ${unique_providers}(v2.0.0 起四个音源互斥单选)"
+        log_err "音源五选一：检测到同时选择了 ${unique_providers}(v2.0.0 起五个音源互斥单选)"
         log_err "请只保留一个音源重新执行；已装 WebUI 时可随时在 WebUI(8774) 里秒级切换音源"
         log_err "旧版本 .env 中的多源配置请重新选择一个后继续"
         exit 1
@@ -1025,16 +1034,18 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     echo "       lxmusic — 洛雪音乐自定义源（装后在管理页配置源脚本）"
     echo "============================================================"
     if [ -z "${SOURCES_RAW}" ]; then
-        echo "【音源四选一】（互斥单选；安装后可在 WebUI 里随时切换，秒级生效）"
+        echo "【音源五选一】（互斥单选；安装后可在 WebUI 里随时切换，秒级生效）"
         echo "  1) musicbox — 网易云音乐盒子（高品质/无损/歌词封面；推荐安装后扫码登录）"
         echo "  2) musicdl  — 聚合音源（多平台可选：酷我/咪咕/酷狗/QQ/B站等）"
         echo "  3) lxmusic  — 洛雪音乐自定义源（解析播放只走用户源；源脚本装后在管理页配置：URL / 上传 .js / NAS 选择）"
         echo "  4) neteasefree — 网易云·免扫码（第三方后端，默认关闭；后端地址装后在管理台确认，仅支持 https）"
-        local_choice="$(prompt "请选择音源 (输入 1/2/3/4)" "2")"
+        echo "  5) qqmusic  — QQ 音乐（默认关闭；装后在管理页扫码或粘贴 Cookie 登录，未登录为 128k 免费档）"
+        local_choice="$(prompt "请选择音源 (输入 1/2/3/4/5)" "2")"
         case "${local_choice}" in
             1) SOURCES_RAW="musicbox" ;;
             3) SOURCES_RAW="lxmusic" ;;
             4) SOURCES_RAW="neteasefree" ;;
+            5) SOURCES_RAW="qqmusic" ;;
             *) SOURCES_RAW="musicdl" ;;
         esac
         if [ "${SOURCES_RAW}" = "musicdl" ]; then
@@ -1182,6 +1193,7 @@ SELECTED=""
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && SELECTED="${SELECTED} musicbox[8770]"
 [ "${ENABLE_MUSICDL}" -eq 1 ] && SELECTED="${SELECTED} musicdl[8768]${MDL_SUMMARY}"
 [ "${ENABLE_NETEASEFREE}" -eq 1 ] && SELECTED="${SELECTED} neteasefree[8776]"
+[ "${ENABLE_QQMUSIC}" -eq 1 ] && SELECTED="${SELECTED} qqmusic[8775]"
 [ "${ENABLE_LX}" -eq 1 ] && SELECTED="${SELECTED} lxmusic[8772]${LX_SUMMARY}"
 
 # 卸载保留数据恢复：检测到持久目录且当前目录无 .env 时自动恢复
@@ -1218,18 +1230,18 @@ fi
 # Reapply after retained-data restoration, before any service starts.
 configure_app_logs || { log_err "无法安全配置私有共享日志目录: ${APP_LOG_DIR}"; exit 1; }
 
-# v2.0.0 升级检测：旧 .env 多源并存（多 true）时强制重新四选一
+# v2.0.0 升级检测：旧 .env 多源并存（多 true）时强制重新选择（五选一）
 if [ -f "${BASE_DIR}/.env" ]; then
     legacy_flags="$(grep -E "^\s*(export\s+)?FNMUSIC_(MUSICDL|NETEASE|NETEASEFREE|LX)_ENABLED=" "${BASE_DIR}/.env" 2>/dev/null \
         | tail -20 | sed -e "s/^.*=//" -e "s/['\"]//g" | tr '[:upper:]' '[:lower:]' \
         | grep -c -E '^(true|1|yes)$' || true)"
     if [ "${legacy_flags:-0}" -gt 1 ]; then
         if [ "${NON_INTERACTIVE}" -eq 1 ]; then
-            log_err "检测到旧版 .env 同时启用了多个音源；v2.0.0 起四音源互斥单选。"
+            log_err "检测到旧版 .env 同时启用了多个音源；v2.0.0 起五音源互斥单选。"
             log_err "请用 --sources 指定唯一音源后重试（musicbox / musicdl / lxmusic / neteasefree）。"
             exit 1
         fi
-        log_warn "检测到旧版 .env 同时启用了多个音源；v2.0.0 起四音源互斥单选，请重新选择。"
+        log_warn "检测到旧版 .env 同时启用了多个音源；v2.0.0 起五音源互斥单选，请重新选择。"
     fi
 fi
 
@@ -1249,7 +1261,8 @@ mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/playlis
     "${SOURCES_DATA_DIR}/cache/netease-musicbox" \
     "${SOURCES_DATA_DIR}/config/netease-musicbox" \
     "${SOURCES_DATA_DIR}/netease-musicbox" \
-    "${SOURCES_DATA_DIR}/lxmusic"
+    "${SOURCES_DATA_DIR}/lxmusic" \
+    "${SOURCES_DATA_DIR}/qqmusic"
 # 数据卷权限收紧：属主对齐容器 appuser（uid 1000，Dockerfile 固定），group/other 全收——
 # 网易 cookie/state.json 等凭据不可被本机其他用户读取；chown 需 root（fpk 安装即 root），
 # 交互安装时调用者本身即属主（fnOS 默认 admin=1000）兜底
@@ -1265,6 +1278,7 @@ chmod 0644 \
     "${BASE_DIR}/musicbox-service/playback.py" \
     "${BASE_DIR}/lxmusic-service/app.py" "${BASE_DIR}/lxmusic-service/source_runtime.py" \
     "${BASE_DIR}/lxmusic-service/verify_source.py" "${BASE_DIR}/lxmusic-service/js/bridge.js" \
+    "${BASE_DIR}/qqmusic-service/app.py" "${BASE_DIR}/qqmusic-service/qqmusic_ext.py" \
     "${BASE_DIR}/webui-service/app.py" "${BASE_DIR}/webui-service/static/index.html" \
     "${BASE_DIR}/webui-service/static/app.js" "${BASE_DIR}/webui-service/static/style.css" \
     2>/dev/null || true
@@ -1273,15 +1287,17 @@ MUSICDL_FLAG="false"
 MUSICBOX_FLAG="false"
 NETEASEFREE_FLAG="false"
 LX_FLAG="false"
+QQMUSIC_FLAG="false"
 [ "${ENABLE_MUSICDL}" -eq 1 ] && MUSICDL_FLAG="true"
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && MUSICBOX_FLAG="true"
 [ "${ENABLE_NETEASEFREE}" -eq 1 ] && NETEASEFREE_FLAG="true"
 [ "${ENABLE_LX}" -eq 1 ] && LX_FLAG="true"
+[ "${ENABLE_QQMUSIC}" -eq 1 ] && QQMUSIC_FLAG="true"
 WEBUI_FLAG="false"
 [ "${WEBUI_CHOICE}" = "yes" ] && WEBUI_FLAG="true"
 
 # --- 写 .env（防覆盖：安全增量合并，脱敏：不打印 key） ---
-# 四源开关与 WebUI 开关先于 up -d 写好：entrypoint 按 .env 只拉起所选程序
+# 五源开关与 WebUI 开关先于 up -d 写好：entrypoint 按 .env 只拉起所选程序
 ENV_PATH="${BASE_DIR}/.env"
 umask 077
 INTERNAL_TOKEN="$(python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[2]); from proxy.env_merge import parse_env_file; print(dict(parse_env_file(Path(sys.argv[1]))[0]).get("FNMUSIC_INTERNAL_TOKEN", ""))' "${ENV_PATH}" "${BASE_DIR}")"
@@ -1314,12 +1330,14 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_MUSICDL_ENABLED='${MUSICDL_FLAG}'"
     echo "FNMUSIC_NETEASE_ENABLED='${MUSICBOX_FLAG}'"
     echo "FNMUSIC_NETEASEFREE_ENABLED='${NETEASEFREE_FLAG}'"
+    echo "FNMUSIC_QQMUSIC_ENABLED='${QQMUSIC_FLAG}'"
     echo "FNMUSIC_NETEASE_DIRECT_PLAY='false'"
     echo "FNMUSIC_MUSICDL_DIRECT_PLAY='false'"
     echo "FNMUSIC_LX_DIRECT_PLAY='false'"
     echo "FNMUSIC_MUSICDL_URL='http://127.0.0.1:8768'"
     echo "FNMUSIC_MUSICBOX_URL='http://127.0.0.1:8770'"
     echo "FNMUSIC_NETEASEFREE_URL='http://127.0.0.1:8776'"
+    echo "FNMUSIC_QQMUSIC_URL='http://127.0.0.1:8775'"
     if [ -n "${NETEASEFREE_API_BASE_CLI}" ]; then
         echo "FNMUSIC_NETEASE_API_BASE='$(dotenv_escape "${NETEASEFREE_API_BASE_CLI}")'"
     elif [ "${KEEP_SOURCES_FROM_ENV:-0}" -eq 1 ]; then
@@ -1375,10 +1393,10 @@ ENV_DESIRED="$(mktemp)"
 } > "${ENV_DESIRED}"
 
 # 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）。
-# 例外：覆盖安装且存量 .env 已有音源配置（KEEP_SOURCES_FROM_ENV=1）时，四开关不进
+# 例外：覆盖安装且存量 .env 已有音源配置（KEEP_SOURCES_FROM_ENV=1）时，五开关不进
 # explicit——env 合并按"非 explicit 键保留已有值"处理，音源选择以用户存量为准，
 # 向导默认值只影响全新安装；第四源后端地址只做透保留，启用与校验在 WebUI 层。
-ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_NETEASEFREE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE,FNMUSIC_SEARCH_PROBE"
+ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_NETEASEFREE_ENABLED,FNMUSIC_QQMUSIC_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE,FNMUSIC_SEARCH_PROBE"
 if [ "${KEEP_SOURCES_FROM_ENV:-0}" -eq 1 ]; then
     ENV_EXPLICIT="FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE,FNMUSIC_SEARCH_PROBE"
 fi
@@ -1387,6 +1405,7 @@ if [ "${INTERNAL_TOKEN_GENERATED}" -eq 1 ]; then
 fi
 [ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
 [ "${ENABLE_NETEASEFREE}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_NETEASEFREE_URL"
+[ "${ENABLE_QQMUSIC}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_QQMUSIC_URL"
 # 第四源后端地址：CLI 显式给出时采用新值；存量保留场景随备份恢复透传。
 [ -n "${NETEASEFREE_API_BASE_CLI}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_NETEASE_API_BASE"
 # lx 源种子（校验通过后会再写一次推导出的 LX_SOURCE_LIST/LX_SOURCES）
@@ -1588,6 +1607,7 @@ sources_quick_ready() {
     [ "${ENABLE_MUSICBOX}" -eq 1 ] && urls="${urls} http://127.0.0.1:8770/healthz"
     [ "${ENABLE_MUSICDL}" -eq 1 ] && urls="${urls} http://127.0.0.1:8768/healthz"
     [ "${ENABLE_NETEASEFREE}" -eq 1 ] && urls="${urls} http://127.0.0.1:8776/healthz"
+    [ "${ENABLE_QQMUSIC}" -eq 1 ] && urls="${urls} http://127.0.0.1:8775/healthz"
     [ "${ENABLE_LX}" -eq 1 ] && urls="${urls} http://127.0.0.1:8772/healthz"
     [ "${WEBUI_FLAG}" = "true" ] && urls="${urls} http://127.0.0.1:8774/healthz"
     # shellcheck disable=SC2086
@@ -1595,6 +1615,30 @@ sources_quick_ready() {
         curl --fail --silent --max-time 3 "${url}" >/dev/null 2>&1 || return 1
     done
     return 0
+}
+
+# 第五源 QQ 端口冲突检查（8775）：已占用且不是本应用的 qqmusic 时明确报错，
+# 不静默覆盖。healthz 可应答视为本应用已运行（重装/升级场景），直接放行。
+ensure_qqmusic_port_available() {
+    [ "${ENABLE_QQMUSIC}" -eq 1 ] || return 0
+    curl --fail --silent --max-time 3 "http://127.0.0.1:8775/healthz" >/dev/null 2>&1 && return 0
+    if python3 - <<'PY' 2>/dev/null
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", 8775))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+    then
+        return 0
+    fi
+    log_err "端口 8775 已被其他进程占用，无法启动 QQ 音乐音源（不会静默覆盖）"
+    log_err "请先释放 127.0.0.1:8775（如 sudo ss -lntp | grep 8775），或改装其它音源后重试"
+    return 1
 }
 
 install_sources_container() {
@@ -1606,6 +1650,7 @@ install_sources_container() {
     else
         reclaim_container "${CONTAINER_NAME}" || return 1
     fi
+    ensure_qqmusic_port_available || return 1
     if ! ensure_image_current; then
         log_err "Docker 镜像保障失败（复用或重建应用镜像未成功），请查看上方原始错误。"
         log_err "应用中心安装日志：${FNMUSIC_DURABLE_LOG:-/var/log/apps/fnmusic-ext-install.log}。"
@@ -1654,6 +1699,16 @@ install_sources_container() {
             log_info "neteasefree 已就绪 http://127.0.0.1:8776/healthz"
         else
             log_err "等待 neteasefree healthz 超时"
+            diagnose_sources_container "${CONTAINER_NAME}"
+            return 1
+        fi
+    fi
+    if [ "${ENABLE_QQMUSIC}" -eq 1 ]; then
+        waited=1
+        if wait_http "http://127.0.0.1:8775/healthz" 60 2; then
+            log_info "qqmusic 已就绪 http://127.0.0.1:8775/healthz"
+        else
+            log_err "等待 qqmusic healthz 超时"
             diagnose_sources_container "${CONTAINER_NAME}"
             return 1
         fi
@@ -1739,7 +1794,7 @@ print(",".join(a))
 }
 
 # --- v2.8.0a 原生（无 Docker）安装：宿主机 systemd unit + supervisord 按需加载 ---
-# 与容器形态功能等价：同一份 .env / sources-data / 发布端口（127.0.0.1:8768/8770/8772/8774），
+# 与容器形态功能等价：同一份 .env / sources-data / 发布端口（127.0.0.1:8768/8770/8772/8774/8775/8776），
 # proxy 侧 URL 与 healthz 契约不变；差异仅在进程承载方式（supervisord 模板见
 # container/supervisord-native.conf.in，unit 模板见 fnmusic-sources-native.service.in）。
 
@@ -1781,6 +1836,7 @@ install_sources_native() {
     log_info "安装并启动原生音源服务 ${NATIVE_UNIT_NAME}.service（所选音源 + WebUI 按需启动）..."
     cleanup_legacy_sources
     remove_conflicting_docker_container || return 1
+    ensure_qqmusic_port_available || return 1
     log_info "准备原生运行时（.venv-sources / supervisor / nodejs / ffmpeg / lxserver）..."
     # 镜像配置：shell 环境优先，其次 .env（docker 形态由构建层消费的同两键）
     local apt_mirror="${FNMUSIC_APT_MIRROR:-}"
@@ -1830,6 +1886,16 @@ install_sources_native() {
             log_info "neteasefree 已就绪 http://127.0.0.1:8776/healthz"
         else
             log_err "等待 neteasefree healthz 超时"
+            diagnose_native
+            return 1
+        fi
+    fi
+    if [ "${ENABLE_QQMUSIC}" -eq 1 ]; then
+        waited=1
+        if wait_http "http://127.0.0.1:8775/healthz" 60 2; then
+            log_info "qqmusic 已就绪 http://127.0.0.1:8775/healthz"
+        else
+            log_err "等待 qqmusic healthz 超时"
             diagnose_native
             return 1
         fi
@@ -1998,6 +2064,7 @@ log_info "【音源服务状态】（未启用的音源进程不驻留内存）"
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • musicbox  [8770] 网易云音源     http://127.0.0.1:8770/healthz"
 [ "${ENABLE_MUSICDL}" -eq 1 ] && log_info "  • musicdl   [8768] 聚合音源${MDL_SUMMARY:+ 平台${MDL_SUMMARY}}   http://127.0.0.1:8768/healthz"
 [ "${ENABLE_NETEASEFREE}" -eq 1 ] && log_info "  • neteasefree [8776] 网易云·免扫码  http://127.0.0.1:8776/healthz（第三方后端，需管理台确认地址）"
+[ "${ENABLE_QQMUSIC}" -eq 1 ] && log_info "  • qqmusic   [8775] QQ 音乐音源     http://127.0.0.1:8775/healthz（装后在管理页扫码或 Cookie 登录）"
 [ "${ENABLE_LX}" -eq 1 ] && log_info "  • lxmusic   [8772] 洛雪自定义源${LX_SUMMARY:+ 平台${LX_SUMMARY}}   http://127.0.0.1:8772/healthz"
 if [ "${WEBUI_FLAG}" = "true" ]; then
     log_info "  • WebUI     [8774] 管理界面      飞牛桌面「fnMusic 扩展管理」（仅管理员）"
@@ -2016,7 +2083,7 @@ log_info "   打开飞牛音乐 Web 端或手机 App，在搜索框中搜索歌�
 log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌词与封面。"
 if [ "${WEBUI_FLAG}" = "true" ]; then
     log_info "3. 管理 Web UI：飞牛桌面「fnMusic 扩展管理」，或已登录管理员打开 /app/fnmusic-ext"
-    log_info "   • 音源四选一随时切换（秒级）、musicdl 平台多选、网易扫码登录"
+    log_info "   • 音源五选一随时切换（秒级）、musicdl 平台多选、网易扫码登录"
     log_info "   • 音质模式（高音质/平衡/流畅）、边听边存、推荐开关、LLM 配置"
 fi
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then

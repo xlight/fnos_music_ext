@@ -66,12 +66,13 @@ RUN set -eu; \
     if [ -n "${APT_MIRROR}" ]; then swap_apt_host "${APT_MIRROR}" 'http://deb.debian.org'; fi; \
     rm -rf /var/lib/apt/lists/*
 
-# 四个服务的 Python 依赖并集（各自 requirements 独立演进，镜像统一安装；现为五个服务，含 neteasefree）
+# 各服务 Python 依赖并集（各自 requirements 独立演进，镜像统一安装；现为六个服务，含 neteasefree 与 qqmusic）
 # 构建容器 DNS 失败自愈同 apt 步骤（resolv.conf 改写不跨 RUN 层持久，需每步自带）；
 # 镜像源安装失败自动回退官方 PyPI 重试
 COPY musicdl-service/requirements.txt /srv/req.musicdl
 COPY musicbox-service/requirements.txt /srv/req.musicbox
 COPY neteasefree-service/requirements.txt /srv/req.neteasefree
+COPY qqmusic-service/requirements.txt /srv/req.qqmusic
 COPY lxmusic-service/requirements.txt /srv/req.lxmusic
 COPY webui-service/requirements.txt /srv/req.webui
 RUN set -eu; \
@@ -83,15 +84,15 @@ RUN set -eu; \
         cat /tmp/resolv.fnmusic > /etc/resolv.conf 2>/dev/null || true; \
     }; \
     fix_dns; \
-    pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.neteasefree -r /srv/req.lxmusic -r /srv/req.webui \
+    pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.neteasefree -r /srv/req.qqmusic -r /srv/req.lxmusic -r /srv/req.webui \
     || { echo "[WARN] pip 镜像源（${PIP_INDEX_URL}）安装失败，回退官方 PyPI 重试..." >&2; \
          pip install --no-cache-dir -i https://pypi.org/simple \
-            -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.neteasefree -r /srv/req.lxmusic -r /srv/req.webui; } \
+            -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.neteasefree -r /srv/req.qqmusic -r /srv/req.lxmusic -r /srv/req.webui; } \
     && rm -f /srv/req.*
 
 RUN groupadd -g 1000 appuser \
     && useradd -m -u 1000 -g 1000 appuser \
-    && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver /data/logs \
+    && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver /data/qqmusic /data/logs \
     && chown -R appuser:appuser /data
 
 # lxserver 预编译包引入：构建上下文优先（预置离线 zip）+ 多镜像加速回退链
@@ -157,6 +158,8 @@ RUN set -eu; \
 COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py musicdl-service/search_core.py musicdl-service/worker.py /srv/musicdl-service/
 COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py musicbox-service/playback.py /srv/musicbox-service/
 COPY --chown=appuser:appuser neteasefree-service/app.py neteasefree-service/netease_api.py neteasefree-service/netease_ext.py /srv/neteasefree-service/
+# 第五源 QQ 音乐：登录凭证（credential.json）与缓存落 /data/qqmusic，不随镜像分发
+COPY --chown=appuser:appuser qqmusic-service/app.py qqmusic-service/qqmusic_ext.py /srv/qqmusic-service/
 # 音质 + 播放编排新模块随本轮一并分发：
 #   proxy/quality_policy.py        —— A 组（主智能体）共享七档音质策略
 #   lxmusic-service/playback_policy.py —— B 组（洛雪）播放编排
@@ -182,7 +185,7 @@ RUN chmod 0755 /usr/local/bin/env_flag.sh /usr/local/bin/entrypoint.sh /usr/loca
     && chmod 0644 /etc/supervisor/supervisord.conf
 
 USER appuser
-EXPOSE 8001 8002 8003 8004 8006
+EXPOSE 8001 8002 8003 8004 8006 8007
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD ["/usr/local/bin/healthcheck.sh"]

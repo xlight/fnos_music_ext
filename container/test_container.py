@@ -27,7 +27,8 @@ def supervisord_conf():
 def test_supervisord_programs_all_autostart_false(supervisord_conf):
     programs = sorted(s for s in supervisord_conf.sections() if s.startswith("program:"))
     assert programs == [
-        "program:lxmusic", "program:lxserver", "program:musicbox", "program:musicdl", "program:neteasefree", "program:webui",
+        "program:lxmusic", "program:lxserver", "program:musicbox", "program:musicdl",
+        "program:neteasefree", "program:qqmusic", "program:webui",
     ]
     for section in programs:
         assert supervisord_conf.get(section, "autostart") == "false"
@@ -51,6 +52,7 @@ def test_supervisord_ports_and_directories(supervisord_conf):
         "musicdl": ("8001", "/srv/musicdl-service"),
         "musicbox": ("8002", "/srv/musicbox-service"),
         "neteasefree": ("8006", "/srv/neteasefree-service"),
+        "qqmusic": ("8007", "/srv/qqmusic-service"),
         "lxmusic": ("8003", "/srv/lxmusic-service"),
         "webui": ("8004", "/srv/webui-service"),
     }
@@ -224,11 +226,12 @@ def entrypoint_env(tmp_path):
     ("FNMUSIC_MUSICDL_ENABLED=true\n", ["start musicdl"]),
     ("FNMUSIC_NETEASE_ENABLED=true\n", ["start musicbox"]),
     ("FNMUSIC_NETEASEFREE_ENABLED=true\n", ["start neteasefree"]),
+    ("FNMUSIC_QQMUSIC_ENABLED=true\n", ["start qqmusic"]),
     ("FNMUSIC_LX_ENABLED=true\n", ["start lxserver", "start lxmusic"]),
     # WebUI 独立开关
     ("FNMUSIC_LX_ENABLED=true\nFNMUSIC_WEBUI_ENABLED=true\n", ["start lxserver", "start lxmusic", "start webui"]),
     ("FNMUSIC_WEBUI_ENABLED=true\n", ["start webui"]),
-    # 旧多源并存：只取第一个命中（musicdl > musicbox > neteasefree > lxmusic），不重复拉起
+    # 旧多源并存：只取第一个命中（musicdl > musicbox > neteasefree > qqmusic > lxmusic），不重复拉起
     ("FNMUSIC_MUSICDL_ENABLED=true\nFNMUSIC_NETEASE_ENABLED=true\nFNMUSIC_LX_ENABLED=true\n",
      ["start musicdl"]),
     # 全关：什么源都不启动
@@ -307,6 +310,7 @@ def test_compose_single_service_layout():
         "127.0.0.1:8768:8001",
         "127.0.0.1:8770:8002",
         "127.0.0.1:8776:8006",
+        "127.0.0.1:8775:8007",
         "127.0.0.1:8772:8003",
         "127.0.0.1:8774:8004",
     ])
@@ -336,7 +340,7 @@ def test_dockerfile_assembly():
     for pkg in ("nodejs", "ffmpeg", "supervisor"):
         assert pkg in text
     for req in ("musicdl-service/requirements.txt", "musicbox-service/requirements.txt",
-                "neteasefree-service/requirements.txt",
+                "neteasefree-service/requirements.txt", "qqmusic-service/requirements.txt",
                 "lxmusic-service/requirements.txt", "webui-service/requirements.txt"):
         assert req in text
     assert "container/lxserver.version" in text
@@ -346,7 +350,7 @@ def test_dockerfile_assembly():
     assert "lxmusic-service/js/bridge.js" not in text
     assert text.count("HEALTHCHECK") >= 1
     assert 'ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]' in text
-    assert "EXPOSE 8001 8002 8003 8004 8006" in text
+    assert "EXPOSE 8001 8002 8003 8004 8006 8007" in text
     # 非特权运行
     assert "USER appuser" in text
     # 数据卷与仓库挂载点；目录不可 world-writable（bind 挂载后跟宿主机权限）
@@ -385,7 +389,7 @@ def test_dockerfile_network_fallback_resilience():
     DNS/NSS，缺失或失败还可能被 set -e 打死，因此改为不探测、始终注入。
     """
     text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
-    apt_step = text.split("# nodejs（洛雪自定义源")[1].split("# 四个服务的")[0]
+    apt_step = text.split("# nodejs（洛雪自定义源")[1].split("# 各服务 Python 依赖并集")[0]
     # DNS 自愈：始终注入备用公共 DNS（仅本构建层内生效），不依赖 getent
     assert "getent hosts" not in apt_step
     assert "223.5.5.5" in apt_step and "119.29.29.29" in apt_step
@@ -403,7 +407,7 @@ def test_dockerfile_network_fallback_resilience():
     # 双源失败时必须报告备用 DNS 注入是否真正生效，区分「注入失败」与「源不可达」
     assert "注入未生效" in apt_step
     # pip 步骤：同样自带 DNS 自愈（resolv.conf 改写不跨 RUN 层）+ 官方 PyPI 回退
-    pip_step = text.split("# 四个服务的")[1]
+    pip_step = text.split("# 各服务 Python 依赖并集")[1]
     assert "getent hosts" not in pip_step
     assert "223.5.5.5" in pip_step
     assert "https://pypi.org/simple" in pip_step
@@ -414,7 +418,7 @@ def test_dockerignore_whitelist_build_context():
     code_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
     # 白名单模式：先忽略一切，再放行四个服务目录与 container/
     assert code_lines[0] == "*"
-    for keep in ("!musicdl-service/", "!musicbox-service/", "!neteasefree-service/", "!lxmusic-service/", "!webui-service/", "!container/"):
+    for keep in ("!musicdl-service/", "!musicbox-service/", "!neteasefree-service/", "!qqmusic-service/", "!lxmusic-service/", "!webui-service/", "!container/"):
         assert keep in code_lines
 
 
@@ -454,7 +458,7 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
     # proxy/app.py 按部署形态动态导入公共歌单模块；正则扫描静态 import 不容易覆盖。
     required = {"publicplaylists"} | set(re.findall(r"\bproxy/([A-Za-z_]\w*)\.py\b", copied))
     origins: dict[str, str] = {"publicplaylists": "动态导入（proxy/app.py）"}
-    for service_dir in ("musicdl-service", "musicbox-service", "neteasefree-service", "lxmusic-service", "webui-service"):
+    for service_dir in ("musicdl-service", "musicbox-service", "neteasefree-service", "qqmusic-service", "lxmusic-service", "webui-service"):
         for py in sorted((REPO_ROOT / service_dir).glob("*.py")):
             # 测试文件（test_*/conftest）不进镜像、不随服务运行：其跨目录 import
             # （如 lxmusic 测试比对 proxy 的 UA 常量）不构成镜像依赖

@@ -19,8 +19,8 @@ const APP_BASE = "/app/fnmusic-ext";
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", musicbox: "网易云音乐盒子", neteasefree: "网易免扫码音源", lxmusic: "洛雪自定义源", none: "未配置" };
-const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", neteasefree: "neteasefree", lxserver: "lxserver", lxmusic: "lxmusic", webui: "WebUI" };
+const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", musicbox: "网易云音乐盒子", neteasefree: "网易免扫码音源", lxmusic: "洛雪自定义源", qqmusic: "QQ 音乐音源", none: "未配置" };
+const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", neteasefree: "neteasefree", lxserver: "lxserver", lxmusic: "lxmusic", qqmusic: "qqmusic", webui: "WebUI" };
 
 let configValues = {};   // GET /api/config 的 values
 let configPresence = {}; // .env 显式存在的键（区分默认空与管理员清空）
@@ -36,6 +36,8 @@ const DOWNLOAD_LAYOUT_LABELS = {
   artist_album: "歌手/专辑/歌曲",
 };
 let qrTimer = null;
+let qqQrTimer = null;
+let qqLoggedIn = false;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
 let lxSourceList = [];    // 本地待保存配置；运行状态轮询不可覆盖 active
 let lxSourceOrder = [];   // 洛雪稳定源 ID 顺序；停用时保留历史位置
@@ -1110,10 +1112,12 @@ function applyConfigToForm() {
   const provider = v.FNMUSIC_NETEASE_ENABLED === "true" ? "musicbox"
     : v.FNMUSIC_NETEASEFREE_ENABLED === "true" ? "neteasefree"
     : v.FNMUSIC_MUSICDL_ENABLED === "true" ? "musicdl"
+    : v.FNMUSIC_QQMUSIC_ENABLED === "true" ? "qqmusic"
     : v.FNMUSIC_LX_ENABLED === "true" ? "lxmusic" : "";
   $$("input[name=provider]").forEach((el) => { el.checked = el.value === provider; });
   syncProviderPanels(provider);
   if (provider === "musicbox") syncNeteaseAccount();
+  if (provider === "qqmusic") syncQqAccount();
   const hasAutoSwitch = Boolean(configSchema.FNMUSIC_LX_AUTO_SWITCH);
   const hasPlatformPreferred = Boolean(configSchema.FNMUSIC_LX_PLATFORM_PREFERRED);
   $("#lx-auto-switch").disabled = !hasAutoSwitch;
@@ -1207,6 +1211,8 @@ function applyConfigToForm() {
   $("#netease-playlist-resident").checked = v.FNMUSIC_NETEASE_PLAYLIST_RESIDENT === "true";
   if ($("#neteasefree-url")) $("#neteasefree-url").value = v.FNMUSIC_NETEASEFREE_URL || "";
   if ($("#neteasefree-api-base")) $("#neteasefree-api-base").value = v.FNMUSIC_NETEASE_API_BASE || "";
+  if ($("#qq-quality")) $("#qq-quality").value = v.FNMUSIC_QQMUSIC_QUALITY || "lossless";
+  if ($("#qq-search-limit")) $("#qq-search-limit").value = v.FNMUSIC_QQMUSIC_SEARCH_LIMIT || "20";
   $("#lx-url").value = "";
   lxVerifiedUrl = null;
   $("#lx-resolver-timeout").value = v.LX_RESOLVER_TIMEOUT || "8.0";
@@ -1258,6 +1264,7 @@ function collectConfig() {
     FNMUSIC_MUSICDL_ENABLED: provider === "musicdl",
     FNMUSIC_NETEASE_ENABLED: provider === "musicbox",
     FNMUSIC_NETEASEFREE_ENABLED: provider === "neteasefree",
+    FNMUSIC_QQMUSIC_ENABLED: provider === "qqmusic",
     FNMUSIC_LX_ENABLED: provider === "lxmusic",
     ...(configSchema.FNMUSIC_NETEASE_DIRECT_PLAY ? { FNMUSIC_NETEASE_DIRECT_PLAY: $("#direct-netease").checked } : {}),
     ...(configSchema.FNMUSIC_MUSICDL_DIRECT_PLAY ? { FNMUSIC_MUSICDL_DIRECT_PLAY: $("#direct-musicdl").checked } : {}),
@@ -1319,6 +1326,8 @@ function collectConfig() {
     FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-playlist-resident").checked
       || (typeof anyPublicMusicboxSelection === "function" && anyPublicMusicboxSelection()),
     ...(configSchema.FNMUSIC_NETEASEFREE_URL ? { FNMUSIC_NETEASEFREE_URL: $("#neteasefree-url").value.trim() } : {}),
+    ...(configSchema.FNMUSIC_QQMUSIC_QUALITY ? { FNMUSIC_QQMUSIC_QUALITY: $("#qq-quality").value || "lossless" } : {}),
+    ...(configSchema.FNMUSIC_QQMUSIC_SEARCH_LIMIT ? { FNMUSIC_QQMUSIC_SEARCH_LIMIT: parseInt($("#qq-search-limit").value || "20", 10) || 20 } : {}),
     ...(configSchema.FNMUSIC_NETEASE_API_BASE ? { FNMUSIC_NETEASE_API_BASE: $("#neteasefree-api-base").value.trim() } : {}),
     LX_SOURCE_LIST: JSON.stringify(lxSourceList),
   };
@@ -1520,6 +1529,7 @@ function savedProvider() {
   return v.FNMUSIC_NETEASE_ENABLED === "true" ? "musicbox"
     : v.FNMUSIC_NETEASEFREE_ENABLED === "true" ? "neteasefree"
     : v.FNMUSIC_MUSICDL_ENABLED === "true" ? "musicdl"
+    : v.FNMUSIC_QQMUSIC_ENABLED === "true" ? "qqmusic"
     : v.FNMUSIC_LX_ENABLED === "true" ? "lxmusic" : "";
 }
 
@@ -1545,11 +1555,13 @@ function syncProviderPanels(provider) {
   $("#panel-musicdl").hidden = provider !== "musicdl";
   $("#panel-neteasefree").hidden = provider !== "neteasefree";
   $("#panel-lxmusic").hidden = provider !== "lxmusic";
+  $("#panel-qqmusic").hidden = provider !== "qqmusic";
 }
 $$("input[name=provider]").forEach((el) =>
   el.addEventListener("change", async () => {
     syncProviderPanels(el.value);
     if (el.value === "musicbox") syncNeteaseAccount();
+    if (el.value === "qqmusic") syncQqAccount();
     markDirty("音源切换需保存后生效");
     if (el.value && el.value !== savedProvider() && await startPreview(el.value)) {
       if (el.value === "musicdl") await loadPlatforms(false);
@@ -2821,6 +2833,139 @@ function stopQrPolling() {
   if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
 }
 $("#qr-btn").addEventListener("click", startQrLogin);
+
+/* -------------------------------------------------------------- qq 音乐登录 */
+function qqSetTierHint(logged) {
+  qqLoggedIn = Boolean(logged);
+  const hint = $("#qq-tier-hint");
+  if (!hint) return;
+  hint.textContent = logged
+    ? "已登录：可按音质档位取链（无权限时自动降档）。"
+    : "未登录：仅可播免费档位（128k），登录后可提升音质。";
+}
+
+async function syncQqAccount(retries = 0) {
+  // 登录态同步到 #qq-login-check 与档位提示；服务未运行视为未登录
+  qqSetTierHint(false);
+  $("#qq-login-check").textContent = "";
+  for (let i = 0; ; i++) {
+    try {
+      const st = await api("/api/qqmusic/auth/status");
+      const d = st.data || st;
+      if (d.logged_in) {
+        qqSetTierHint(true);
+        $("#qq-login-check").textContent = `当前登录：${d.nickname || d.musicid || "已登录用户"}`;
+        return;
+      }
+      $("#qq-login-check").textContent = "未登录";
+      return;
+    } catch (_) { /* status 不可达视为未登录 */ }
+    if (i >= retries) { $("#qq-login-check").textContent = "未登录"; return; }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+}
+
+async function startQqQrLogin() {
+  stopQqQrPolling();
+  $("#qq-qr-status").textContent = "正在生成二维码…";
+  $("#qq-qr-img").hidden = true;
+  syncQqAccount();
+  const callLogin = () => api("/api/qqmusic/auth/login", { method: "POST" });
+  try {
+    let data;
+    try {
+      data = await callLogin();
+    } catch (exc) {
+      // qqmusic 进程未运行（未点选/预览过期）：临时拉起后重试一次
+      if (!await startPreview("qqmusic")) throw exc;
+      data = await callLogin();
+    }
+    const d = data.data || data;
+    const qrId = d.qr_id || d.id || "";
+    if (!qrId) throw new Error("未获取到二维码 id");
+    $("#qq-qr-img").src = `${APP_BASE}/api/qqmusic/qr?id=${encodeURIComponent(qrId)}`;
+    $("#qq-qr-img").hidden = false;
+    $("#qq-qr-status").textContent = "请用手机 QQ 音乐 App 扫码";
+    pollQqQr(qrId);
+  } catch (exc) {
+    $("#qq-qr-status").textContent = "生成失败：" + exc.message;
+  }
+}
+
+async function checkQqQrStatus(qrId) {
+  const st = await api(`/api/qqmusic/auth/login/check?id=${encodeURIComponent(qrId)}`);
+  const d = st?.data || st;
+  const code = Number(d?.code ?? st?.code);
+  if (code === 803) {
+    stopQqQrPolling();
+    $("#qq-qr-status").textContent = "登录成功 ✓";
+    syncQqAccount(2);
+    toast("QQ 音乐登录成功", "ok");
+  } else if (code === 802) {
+    $("#qq-qr-status").textContent = "已扫码，请在手机上确认";
+  } else if (code === 804) {
+    stopQqQrPolling();
+    $("#qq-qr-status").textContent = "已拒绝授权，请重新生成二维码";
+  } else if (code === 800) {
+    stopQqQrPolling();
+    $("#qq-qr-status").textContent = "二维码已过期，请重新生成";
+  } else {
+    $("#qq-qr-status").textContent = "等待扫码…";
+  }
+}
+
+function pollQqQr(qrId, intervalMs = 2000) {
+  stopQqQrPolling();
+  qqQrTimer = setInterval(() => { checkQqQrStatus(qrId).catch(() => {}); }, intervalMs);
+}
+
+function stopQqQrPolling() {
+  if (qqQrTimer) { clearInterval(qqQrTimer); qqQrTimer = null; }
+}
+
+async function submitQqCookie() {
+  const raw = $("#qq-cookie").value.trim();
+  if (!raw) { $("#qq-cookie-check").textContent = "请先粘贴 Cookie"; return; }
+  $("#qq-cookie-check").textContent = "校验中…";
+  try {
+    let r;
+    try {
+      r = await api("/api/qqmusic/auth/cookie", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cookie: raw }),
+      });
+    } catch (exc) {
+      if (!await startPreview("qqmusic")) throw exc;
+      r = await api("/api/qqmusic/auth/cookie", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cookie: raw }),
+      });
+    }
+    const d = r.data || r;
+    $("#qq-cookie-check").textContent = d?.logged_in === false ? "Cookie 校验未通过" : "已登录 ✓";
+    $("#qq-cookie").value = "";
+    syncQqAccount(2);
+  } catch (exc) {
+    $("#qq-cookie-check").textContent = "失败：" + exc.message;
+  }
+}
+
+async function logoutQq() {
+  try {
+    await api("/api/qqmusic/auth/logout", { method: "POST" });
+    $("#qq-qr-status").textContent = "已退出登录";
+    $("#qq-qr-img").hidden = true;
+    stopQqQrPolling();
+    syncQqAccount();
+  } catch (exc) {
+    toast("退出登录失败：" + exc.message, "fail");
+  }
+}
+$("#qq-qr-btn").addEventListener("click", startQqQrLogin);
+$("#qq-cookie-btn").addEventListener("click", submitQqCookie);
+$("#qq-logout-btn").addEventListener("click", logoutQq);
 
 $("#netease-playlist-resident").addEventListener("change", () => {
   // 常驻为账号/公共歌单供数；仅在没有公共选择时自动带出账号歌单开关。

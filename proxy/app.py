@@ -148,17 +148,24 @@ CONF = {
     "musicdl_url": os.environ.get("FNMUSIC_MUSICDL_URL", "http://127.0.0.1:8768"),
     "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
     "neteasefree_url": os.environ.get("FNMUSIC_NETEASEFREE_URL", "http://127.0.0.1:8776"),
+    # 第五源 QQ 音乐：独立小服务，默认关闭、默认不驻留
+    "qqmusic_url": os.environ.get("FNMUSIC_QQMUSIC_URL", "http://127.0.0.1:8775"),
     "netease_api_base": (os.environ.get("FNMUSIC_NETEASE_API_BASE") or "").strip().rstrip("/"),
     "lx_url": os.environ.get("FNMUSIC_LX_URL", "http://127.0.0.1:8772"),
     "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "neteasefree_enabled": os.environ.get("FNMUSIC_NETEASEFREE_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
+    "qqmusic_enabled": os.environ.get("FNMUSIC_QQMUSIC_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
+    # 歌单同步属 P2：键先保留，本轮不接任何行为
+    "qqmusic_playlists_enabled": os.environ.get("FNMUSIC_QQMUSIC_PLAYLISTS_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "netease_direct_play": os.environ.get("FNMUSIC_NETEASE_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
     "musicdl_direct_play": os.environ.get("FNMUSIC_MUSICDL_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
     "lx_direct_play": os.environ.get("FNMUSIC_LX_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
     "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "20")),
     "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
+    "qqmusic_quality": os.environ.get("FNMUSIC_QQMUSIC_QUALITY", "lossless").strip().lower(),
+    "qqmusic_search_limit": max(1, min(100, int(os.environ.get("FNMUSIC_QQMUSIC_SEARCH_LIMIT", "20")))),
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
     # 输入停满这么久才向音源发起搜索。窗口内的新词会替换旧词并重新计时。
     "search_debounce_s": float(os.environ.get("FNMUSIC_SEARCH_DEBOUNCE_S", "1.0")),
@@ -554,7 +561,7 @@ def _user_search_stale(entry: dict, scope: str) -> bool:
 
 
 def reset_source_search_gates() -> None:
-    for gate in (_LX_SEARCH_GATE, _MUSICDL_SEARCH_GATE, _MUSICBOX_SEARCH_GATE):
+    for gate in (_LX_SEARCH_GATE, _MUSICDL_SEARCH_GATE, _MUSICBOX_SEARCH_GATE, _QQMUSIC_SEARCH_GATE):
         gate.reset()
     _USER_SEARCH_GEN.clear()
     _USER_SEARCH_WORD.clear()
@@ -564,6 +571,8 @@ def reset_source_search_gates() -> None:
 _LX_SEARCH_GATE = SourceSearchGate(cancellable=True)
 _MUSICDL_SEARCH_GATE = SourceSearchGate(cancellable=False)
 _MUSICBOX_SEARCH_GATE = SourceSearchGate(cancellable=False)
+# 第五源与 musicbox 同理不可取消：上游搜索无中间态，中途取消会白烧一次配额。
+_QQMUSIC_SEARCH_GATE = SourceSearchGate(cancellable=False)
 
 
 def _search_ttl(entry: dict) -> float:
@@ -613,6 +622,10 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_NETEASE_ENABLED": ("netease_enabled", "bool"),
     "FNMUSIC_NETEASEFREE_ENABLED": ("neteasefree_enabled", "bool"),
     "FNMUSIC_NETEASEFREE_URL": ("neteasefree_url", "str"),
+    "FNMUSIC_QQMUSIC_ENABLED": ("qqmusic_enabled", "bool"),
+    "FNMUSIC_QQMUSIC_URL": ("qqmusic_url", "str"),
+    "FNMUSIC_QQMUSIC_QUALITY": ("qqmusic_quality", "qqmusic_quality"),
+    "FNMUSIC_QQMUSIC_SEARCH_LIMIT": ("qqmusic_search_limit", "qqmusic_search_limit"),
     "FNMUSIC_NETEASE_API_BASE": ("netease_api_base", "netease_api_base"),
     "FNMUSIC_LX_ENABLED": ("lx_enabled", "bool"),
     "FNMUSIC_NETEASE_DIRECT_PLAY": ("netease_direct_play", "direct_bool"),
@@ -766,6 +779,13 @@ def _env_watch_parse(raw: str, kind: str):
         return raw.lower() if raw.lower() in ("app", "original", "standard") else None
     if kind == "netease_quality":
         return raw.lower() if raw.lower() in _NETEASE_QUALITY_LADDER else None
+    if kind == "qqmusic_quality":
+        return raw.lower() if raw.lower() in _QQMUSIC_QUALITY_LADDER else None
+    if kind == "qqmusic_search_limit":
+        try:
+            return max(1, min(100, int(raw))) if raw else 20
+        except (TypeError, ValueError):
+            return None
     if kind == "netease_api_base":
         # 第四源第三方后端地址透传：允许空（用服务内置默认），非空仅做去尾斜杠，https 校验在 WebUI 层。
         text = raw.strip().rstrip("/")
@@ -974,8 +994,8 @@ def _env_watch_stat(path: "str | None" = None):
 _LX_CONFIG_KEYS = {"lx_enabled", "lx_quality", "play_quality", "quality_mode", "lx_sources", "lx_source_url", "lx_source_list"}
 _DL_CONFIG_KEYS = {
     "play_quality", "download_quality", "quality_mode", "dl_quality",
-    "netease_quality", "lx_quality", "lx_enabled", "netease_enabled", "neteasefree_enabled", "musicdl_enabled",
-    "online_sources", "lx_sources", "lx_source_url", "lx_source_list", "neteasefree_url", "netease_api_base",
+    "netease_quality", "lx_quality", "qqmusic_quality", "lx_enabled", "netease_enabled", "neteasefree_enabled", "musicdl_enabled",
+    "qqmusic_enabled", "online_sources", "lx_sources", "lx_source_url", "lx_source_list", "neteasefree_url", "qqmusic_url", "netease_api_base",
 }
 
 
@@ -1014,6 +1034,7 @@ def effective_download_quality_conf() -> str:
     return qp.effective_download_quality(values)
 _SOURCE_CONF_KEYS = {
     "musicdl_enabled", "netease_enabled", "neteasefree_enabled", "lx_enabled", "online_sources", "lx_sources",
+    "qqmusic_enabled", "qqmusic_url", "qqmusic_quality", "qqmusic_search_limit",
     "lx_source_url", "lx_source_list", "neteasefree_url", "netease_api_base",
 }
 _DIRECT_PLAY_CONF_KEYS = {
@@ -1406,6 +1427,10 @@ def _source_enabled(guid: str) -> bool:
     if source == "netease":
         if not _netease_runtime_usable():
             return False
+    elif source == "qqmusic":
+        # 第五源豁免 online_sources 名单（那是 musicdl 库的源名清单），只看自身启用位；
+        # 启用位映射 qqmusic->qqmusic_enabled，不能落到 musicdl_enabled 上。
+        return bool(CONF.get("qqmusic_enabled"))
     elif not CONF.get({"lx": "lx_enabled"}.get(source, "musicdl_enabled")):
         return False
     if source == "lx":
@@ -1660,6 +1685,8 @@ def source_from_online_guid(guid: str) -> str:
 _SOURCE_TAG_NETEASE = "[music box] "
 _SOURCE_TAG_MUSICDL = "[dl] "
 _SOURCE_TAG_LX_FALLBACK = "[lx] "
+# 第五源 QQ 音乐固定标记（仅显示；入库/收藏命名前经 strip_source_tag 剥离）
+_SOURCE_TAG_QQ = "[QQ] "
 # issue #57：无 VIP 权益账号的网易 VIP 曲目展示标记（点播只有试听，给用户预期）。
 # 独立于来源标记：所有出口的 VO 都可携带；入库/收藏命名前经 strip_source_tag 剥离。
 _SOURCE_TAG_VIP = "[VIP] "
@@ -1814,6 +1841,8 @@ def source_display_prefix(src: str, item: dict | None = None) -> str:
     s = str(src or "").strip()
     if s == "netease":
         return _SOURCE_TAG_NETEASE
+    if s == "qqmusic":
+        return _SOURCE_TAG_QQ
     if s == "lx":
         platform = lx_platform_from_item(item)
         if platform:
@@ -1837,7 +1866,7 @@ def strip_source_tag(title: str) -> str:
     业务命名前必须剥净。"""
     t = str(title or "")
     candidates = [_SOURCE_TAG_NETEASE, _SOURCE_TAG_MUSICDL, _SOURCE_TAG_LX_FALLBACK,
-                  _SOURCE_TAG_VIP, *_LX_DISPLAY_TAGS]
+                  _SOURCE_TAG_QQ, _SOURCE_TAG_VIP, *_LX_DISPLAY_TAGS]
     script_parts = {"lx", *_LX_SCRIPT_MAP_CACHE["by_platform"].values()}
     for entry in _lx_source_entries():
         name = str(entry.get("name") or "").strip()
@@ -3369,15 +3398,6 @@ def get_musicbox_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
-def get_neteasefree_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
-    """第四源免扫码网易客户端：与 musicbox 同款 /api/v1/* 契约，独立超时，默认关闭。"""
-    client = getattr(fastapi_app.state, "neteasefree_client", None)
-    if client is None:
-        client = httpx.AsyncClient(base_url=CONF["neteasefree_url"], timeout=20.0)
-        fastapi_app.state.neteasefree_client = client
-    return client
-
-
 def _active_netease_client(fastapi_app: FastAPI) -> httpx.AsyncClient | None:
     """网易系播放/歌词/取链运行期客户端：musicbox（含常驻）优先，其次第四源。
 
@@ -3394,6 +3414,15 @@ def get_lx_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     if client is None:
         client = httpx.AsyncClient(base_url=CONF["lx_url"], timeout=25.0)
         fastapi_app.state.lx_client = client
+    return client
+
+
+def get_qqmusic_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    """第五源 QQ 音乐客户端：与 musicbox 同款 /api/v1/* 契约，独立超时，默认关闭。"""
+    client = getattr(fastapi_app.state, "qqmusic_client", None)
+    if client is None:
+        client = httpx.AsyncClient(base_url=CONF["qqmusic_url"], timeout=20.0)
+        fastapi_app.state.qqmusic_client = client
     return client
 
 
@@ -3549,6 +3578,184 @@ async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: 
         return await _musicbox_search_request(client, keyword, limit, offset)
 
     return await _MUSICBOX_SEARCH_GATE.run(scope, keyword, _query)
+
+
+# ---------------------------------------------------- 第五源：QQ 音乐（搜索/取链）--
+
+# QQ CDN 对无 Referer 的拉流会回 403（防盗链），播放与转码都要带上这两个头。
+# 用函数而非模块级字典：_MEDIA_UA_PC 在本文件后面才定义。
+def _qqmusic_cdn_headers() -> dict[str, str]:
+    return {"User-Agent": _MEDIA_UA_PC, "Referer": "https://y.qq.com/"}
+
+# 钉链：mid -> (url, 到期单调时钟, meta)。QQ vkey 短命，过期即重解析。
+_QQMUSIC_URL_PIN: dict[str, tuple[str, float, dict]] = {}
+# 并发合并：同一 mid 同时在飞的解析只发一份，其余请求共享结果。
+_QQMUSIC_URL_INFLIGHT: dict[str, asyncio.Task] = {}
+_QQMUSIC_RESOLVE_TIMEOUT_S = 13.0
+_QQMUSIC_RESOLVE_BUDGET_S = 20.0
+
+
+def _qqmusic_pin_get(mid: str) -> tuple[str, dict] | None:
+    pin = _QQMUSIC_URL_PIN.get(mid)
+    if not pin:
+        return None
+    url, deadline, meta = pin
+    if not url or deadline <= time.monotonic():
+        _QQMUSIC_URL_PIN.pop(mid, None)
+        return None
+    return url, dict(meta)
+
+
+def _qqmusic_pin_put(mid: str, url: str, meta: dict) -> None:
+    try:
+        ttl = float(meta.get("expiration") or 0)
+    except (TypeError, ValueError):
+        ttl = 0.0
+    # 上游 vkey 寿命不固定，限幅到 30s..600s，既不复用过短也不越过真实有效期。
+    ttl = min(max(ttl, 30.0), 600.0) if ttl else 60.0
+    _QQMUSIC_URL_PIN[mid] = (url, time.monotonic() + ttl, dict(meta))
+
+
+def _qqmusic_url_pin_drop(mid: str, reason: str = "") -> None:
+    _QQMUSIC_URL_PIN.pop(mid, None)
+    if reason:
+        fn_diag(logger, "qqmusic_pin_drop", mid=mid, reason=reason)
+
+
+async def _qqmusic_search_request(client: httpx.AsyncClient, keyword: str, limit: int, offset: int = 0) -> list[dict] | None:
+    """QQ 源搜索。失败一律返回 None（瞬时失败），不拿空列表冒充“已取尽”。"""
+    params: dict[str, Any] = {"keyword": keyword, "limit": limit, "type": "song"}
+    if offset > 0:
+        params["offset"] = offset
+    try:
+        r = await client.get("/api/v1/search", params=params, timeout=15.0)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, dict) or data.get("ok") is False:
+            return None
+        raw_list = data.get("data")
+        if not isinstance(raw_list, list):
+            return None
+        items = []
+        for it in raw_list:
+            if not isinstance(it, dict):
+                continue
+            mid = str(it.get("song_id") or it.get("song_mid") or "")
+            if not mid:
+                continue
+            duration = it.get("duration") or 0
+            try:
+                # QQ 搜索回的 duration 是秒
+                duration_s = float(duration)
+            except (TypeError, ValueError):
+                duration_s = 0.0
+            quality = str(it.get("quality") or "").upper()
+            item = {
+                "id": f"qqmusic:{mid}",
+                "source": "qqmusic",
+                "version": str(it.get("version") or ""),
+                "title": str(it.get("song_name") or it.get("title") or ""),
+                "artist": str(it.get("artist") or ""),
+                "album": str(it.get("album_name") or it.get("album") or ""),
+                "duration_s": duration_s,
+                "ext": "flac" if "SQ" in quality else "mp3",
+                "cover_url": str(it.get("album_pic_url") or ""),
+                "lyric": "",
+                "fee": int(it.get("fee") or 0),
+            }
+            if it.get("needs_vip"):
+                item["needs_vip"] = True
+            if not is_playable_online_track(item):
+                continue
+            items.append(item)
+        return items
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Failed to fetch qqmusic search: %s", e)
+        return None
+
+
+async def fetch_qqmusic_search(client: httpx.AsyncClient, keyword: str, limit: int, offset: int = 0) -> list[dict] | None:
+    if not keyword:
+        return None
+    scope = _FETCH_SCOPE.get()
+
+    async def _query():
+        return await _qqmusic_search_request(client, keyword, limit, offset)
+
+    return await _QQMUSIC_SEARCH_GATE.run(scope, keyword, _query)
+
+
+async def _qqmusic_resolve_once(client: httpx.AsyncClient, mid: str, quality: str, mode: str) -> tuple[str, dict] | None:
+    params = {"quality": quality, "mode": mode, "fresh": 1}
+    try:
+        r = await asyncio.wait_for(
+            client.get(f"/api/v1/song/{quote(mid)}/url", params=params, timeout=_QQMUSIC_RESOLVE_TIMEOUT_S),
+            timeout=_QQMUSIC_RESOLVE_BUDGET_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("qqmusic url resolve timeout (%s)", mid)
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("qqmusic url resolve failed (%s): %s", mid, e)
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        payload = r.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict) or payload.get("ok") is False:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    url = str(data.get("url") or "")
+    if not url.startswith(("http://", "https://")):
+        return None
+    meta = {
+        "ext": str(data.get("ext") or "").lstrip("."),
+        "quality": str(data.get("quality") or ""),
+        "expiration": data.get("expiration"),
+        "actual_quality": quality,
+    }
+    return url, meta
+
+
+async def resolve_qqmusic_url(client: httpx.AsyncClient, mid: str, quality: str | None = None,
+                             mode: str | None = None, fresh: bool = False) -> tuple[str, dict] | None:
+    """取 QQ 播放直链：钉链缓存优先，并发合并，失败不缓存。
+
+    返回 (url, meta)；meta 含 ext/quality/expiration/actual_quality。
+    盗链/坏流由调用方通过 _qqmusic_url_pin_drop 丢弃钉链后重解析。
+    """
+    if not mid:
+        return None
+    if not fresh:
+        cached = _qqmusic_pin_get(mid)
+        if cached:
+            return cached
+    target_quality = str(quality or CONF.get("qqmusic_quality") or "lossless").strip().lower()
+    target_mode = str(mode or CONF.get("quality_mode") or "high").strip().lower()
+    key = f"{mid}|{target_quality}|{target_mode}"
+    task = _QQMUSIC_URL_INFLIGHT.get(key)
+    if task is None or task.done():
+        task = asyncio.ensure_future(
+            _qqmusic_resolve_once(client, mid, target_quality, target_mode))
+        _QQMUSIC_URL_INFLIGHT[key] = task
+        task.add_done_callback(lambda t, k=key: _QQMUSIC_URL_INFLIGHT.pop(k, None))
+    try:
+        resolved = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning("qqmusic url resolve error (%s): %s", mid, e)
+        return None
+    if not resolved:
+        return None
+    url, meta = resolved
+    _qqmusic_pin_put(mid, url, meta)
+    return url, meta
 
 
 async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limit: int, offset: int = 0) -> list[dict] | None:
@@ -3736,6 +3943,8 @@ async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int
 # 音质档（从低到高）：旧网易 6 档保留仅用于 quality_order 旧兼容；
 # 新统一七档阶梯由 quality_policy 模块维护。
 _NETEASE_QUALITY_LADDER = ["standard", "higher", "exhigh", "lossless", "hires", "jymaster"]
+# QQ 音质档位（无 jymaster；与 qqmusic-service 的 QUALITY_WHITELIST 对齐）
+_QQMUSIC_QUALITY_LADDER = ["standard", "higher", "exhigh", "lossless", "hires"]
 _LX_QUALITY_LADDER = ["standard", "high", "lossless"]
 
 
@@ -5754,14 +5963,16 @@ async def ext_healthz(request: Request):
               # 网易云歌单常驻：musicbox 非当前音源时仍是健康检查的一部分（issue #38）
               ("musicbox", _netease_runtime_usable(), get_musicbox_client, "/healthz"),
               ("neteasefree", CONF.get("neteasefree_enabled"), get_neteasefree_client, "/healthz"),
-              ("lxmusic", CONF.get("lx_enabled"), get_lx_client, "/healthz")]
+              ("lxmusic", CONF.get("lx_enabled"), get_lx_client, "/healthz"),
+              # 第五源 QQ 音乐：仅启用时探活，未启用不视为故障
+              ("qqmusic", CONF.get("qqmusic_enabled"), get_qqmusic_client, "/healthz")]
     enabled = [(name, getter, path) for name, on, getter, path in checks if on]
     results = await asyncio.gather(*(probe(name, getter(request.app), path) for name, getter, path in enabled))
     details = {name: {"status": "disabled"} for name, on, _, _ in checks if not on}
     details.update({name: result for (name, _, _), result in zip(enabled, results)})
     statuses = {name: value["status"] for name, value in details.items()}
     failed = [name for name, status in statuses.items() if status == "fail"]
-    source_ok = any(statuses[name] == "ok" for name in ("musicdl", "musicbox", "neteasefree", "lxmusic"))
+    source_ok = any(statuses[name] == "ok" for name in ("musicdl", "musicbox", "neteasefree", "lxmusic", "qqmusic"))
     return {"ok": statuses["upstream"] == "ok" and source_ok, "version": get_version(),
             **statuses, "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
             "recommend": {
@@ -5967,6 +6178,10 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
         factories.append(lambda: fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"]))
     if CONF.get("lx_enabled"):
         factories.append(lambda: fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"]))
+    # 第五源 QQ 音乐：与 musicbox 同款 /api/v1/* 契约，默认关闭，旧四源顺序不变。
+    if CONF.get("qqmusic_enabled"):
+        factories.append(lambda: fetch_qqmusic_search(
+            get_qqmusic_client(request.app), keyword, CONF["qqmusic_search_limit"]))
     tasks = [asyncio.create_task(factory()) for factory in factories]
     task_factory = dict(zip(tasks, factories))
     pending = set(tasks)
@@ -6072,7 +6287,8 @@ def _deep_sources_available(entry: dict) -> bool:
     if int(entry.get("deep_round") or 1) >= max(1, int(CONF.get("search_deep_max_pages") or 10)):
         return False
     exhausted = entry.get("exhausted") or set()
-    for name, env_key in (("netease", "netease_enabled"), ("neteasefree", "neteasefree_enabled"), ("lx", "lx_enabled")):
+    for name, env_key in (("netease", "netease_enabled"), ("neteasefree", "neteasefree_enabled"),
+                          ("lx", "lx_enabled"), ("qqmusic", "qqmusic_enabled")):
         if CONF.get(env_key) and name not in exhausted:
             return True
     return False
@@ -6091,7 +6307,7 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
     if _user_search_stale(entry, scope):
         return
     if round_no >= max(1, int(CONF.get("search_deep_max_pages") or 10)):
-        entry.setdefault("exhausted", set()).update({"netease", "neteasefree", "lx"})
+        entry.setdefault("exhausted", set()).update({"netease", "neteasefree", "lx", "qqmusic"})
         return
     token = _FETCH_SCOPE.set(scope)
     try:
@@ -6115,6 +6331,12 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
             lx_cursor = cursors.get("lx", 1)
             fetches.append(("lx", _lx_search_request(
                 get_lx_client(request.app), keyword, CONF["lx_search_limit"], None, scope, page=lx_cursor + 1)))
+        # 第五源沿用 offset 式分页契约：游标是页码，失败不前进、不置 exhausted。
+        if CONF.get("qqmusic_enabled") and "qqmusic" not in exhausted:
+            limit = int(CONF["qqmusic_search_limit"])
+            q_cursor = cursors.get("qqmusic", 1)
+            fetches.append(("qqmusic", _qqmusic_search_request(
+                get_qqmusic_client(request.app), keyword, limit, offset=q_cursor * limit)))
         if not fetches:
             return
         results = await asyncio.gather(*[coro for _, coro in fetches], return_exceptions=True)
@@ -6145,7 +6367,7 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
             merged = deduplicate_online_items(merged + items)[:2000]
 
         if len(merged) >= 2000:
-            exhausted.update({"netease", "neteasefree", "lx"})
+            exhausted.update({"netease", "neteasefree", "lx", "qqmusic"})
         entry["items"] = merged
         entry["deep_round"] = round_no + 1
         entry["accessed"] = time.time()
@@ -7397,6 +7619,8 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
             parts = guid.split(":")
             coro = fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"],
                                    sources=[parts[2]] if len(parts) >= 4 else None)
+        elif source == "qqmusic":
+            coro = fetch_qqmusic_search(get_qqmusic_client(request.app), keyword, CONF["qqmusic_search_limit"])
         else:
             selected = [name.strip() for name in str(CONF.get("online_sources") or "").split(",")
                         if name.strip().lower().removesuffix("musicclient") == source.lower()]
@@ -7440,7 +7664,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
     netease_download_generation = None
     lx_pin_key = None
     try:
-        if source in ("netease", "lx"):
+        if source in ("netease", "lx", "qqmusic"):
             # issue #55：元数据快路径与取链解析并行发起（此前解析完再串行等
             # 0.75s），成功路径省一整段 info 快路径耗时；解析失败则取消不悬挂
             info_task = asyncio.ensure_future(_fetch_online_info(request, guid, include_lyric=False)) if info is None else None
@@ -7472,7 +7696,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     if not url:
                         return None
                     headers["User-Agent"] = _MEDIA_UA_PC
-                else:
+                elif source == "lx":
                     song_id = song_id_from_online_guid(guid)
                     if purpose != "download" and _lx_fresh_cooldown_active(song_id) and not _lx_url_pin_valid(song_id):
                         return None
@@ -7496,6 +7720,25 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     ext = resolved.get("ext")
                     actual_quality = _netease_quality_evidence(resolved)
                     headers.update(_lx_media_headers(resolved))
+                else:
+                    # 第五源 QQ：走服务 /api/v1/song/{mid}/url，降档阶梯与权限判定由服务侧完成。
+                    mid = song_id_from_online_guid(guid)
+                    force_std = bool((force_mp3 or _lossless_is_blacklisted(guid)) and not range_header)
+                    if force_std:
+                        fn_diag(logger, "lossless_downgrade", guid=guid, path="stream_open", tier="mp3")
+                    resolved_qq = await resolve_qqmusic_url(
+                        get_qqmusic_client(request.app), mid,
+                        quality=quality_override if purpose == "download" else ("standard" if force_std else None),
+                        mode=CONF.get("quality_mode") or "high",
+                        fresh=fresh_url or refresh,
+                    )
+                    if not resolved_qq:
+                        return None
+                    url, qq_meta = resolved_qq
+                    ext = str(qq_meta.get("ext") or "") or None
+                    actual_quality = str(qq_meta.get("quality") or "unknown")
+                    # 防盗链：QQ CDN 需带 UA + Referer
+                    headers.update(_qqmusic_cdn_headers())
                 if info_task is not None:
                     if source == "netease":
                         if info_task.done() and not info_task.cancelled():
@@ -7567,6 +7810,9 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     # issue #54：fresh 强刷出的直链也打不开，冷却窗内不再重复重解析
                     if fresh_url:
                         _lx_fresh_cooldown_mark(lx_pin_key or song_id)
+                elif source == "qqmusic":
+                    # 盗链/非音频响应：丢弃钉链，下次重解析
+                    _qqmusic_url_pin_drop(mid, reason=f"cdn_status_{resp.status_code}_or_non_audio")
                 return None
             chunks = resp.aiter_bytes()
             first = await anext(chunks, b"")
@@ -7589,6 +7835,8 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 _lx_url_pin_drop(lx_pin_key or song_id, reason="empty_stream")
                 if fresh_url:
                     _lx_fresh_cooldown_mark(lx_pin_key or song_id)
+            elif source == "qqmusic":
+                _qqmusic_url_pin_drop(mid, reason="empty_stream")
             return None
         if source == "netease" and not ext:
             # issue IKS5FW 兜底：取链响应缺 type/level（或钉链为旧形态无 meta）
@@ -7870,7 +8118,22 @@ def _direct_internal_token() -> str:
     return token
 
 
+def _direct_provider_for_source(source: str) -> str | None:
+    """直连播放的 provider 归属。QQ 源不参与直连，返回 None。
+
+    非 netease/lx 的源（musicdl 库的 kuwo/migu 等）沿用 musicdl 通道。
+    """
+    if source in ("netease", "lx"):
+        return source
+    if source == "qqmusic":
+        return None
+    return "musicdl"
+
+
 async def _resolve_direct_target(request: Request, guid: str, source: str) -> DirectMediaTarget:
+    if source == "qqmusic":
+        # 防线：QQ 源不得因 provider 误判走 musicdl 的 /internal/resolve。
+        raise RuntimeError("direct_unsupported")
     provider = "netease" if source == "netease" else "lx" if source == "lx" else "musicdl"
     generation = _DIRECT_PLAY_GENERATIONS[provider]
     now = time.time()
@@ -7979,8 +8242,8 @@ def _direct_file_response_guard(request: Request, guid: str, path: str) -> Respo
     if request.query_params.get("_ext_hls_stub") == "1":
         return None
     source = source_from_online_guid(guid)
-    provider = source if source in ("netease", "lx") else "musicdl"
-    if not CONF.get(_DIRECT_PLAY_CONF_KEYS[provider]):
+    provider = _direct_provider_for_source(source)
+    if provider is None or not CONF.get(_DIRECT_PLAY_CONF_KEYS[provider]):
         return None
     scope = _direct_scope(request)
     if _nonzero_range(request.headers.get("range")):
@@ -8006,11 +8269,14 @@ async def _direct_redirect_response(request: Request, guid: str) -> Response | N
     source = source_from_online_guid(guid)
     if not is_online_guid(guid) or not source:
         return None
-    provider = {"netease": "netease", "lx": "lx"}.get(source, "musicdl")
+    provider = _direct_provider_for_source(source)
     scope = _direct_scope(request)
     range_header = request.headers.get("range")
     if request.query_params.get("_ext_hls_stub") == "1":
         fn_diag(logger, "direct_bypassed", guid=guid, reason="hls_stub")
+        return None
+    if provider is None:
+        fn_diag(logger, "direct_bypassed", guid=guid, reason="source_no_direct")
         return None
     if not CONF.get(_DIRECT_PLAY_CONF_KEYS[provider]):
         if _nonzero_range(range_header) and _DIRECT_TARGET_BINDINGS.known(scope, guid):
@@ -9217,9 +9483,9 @@ async def stream_track(request: Request, subpath: str = ""):
             and _DIRECT_TARGET_BINDINGS.known(_direct_scope(request), guid)):
         return await _direct_redirect_response(request, guid)
     source = source_from_online_guid(guid)
-    provider = source if source in ("netease", "lx") else "musicdl"
+    provider = _direct_provider_for_source(source)
     if (_nonzero_range(range_header) and request.query_params.get("_ext_hls_stub") != "1"
-            and CONF.get(_DIRECT_PLAY_CONF_KEYS[provider])
+            and provider is not None and CONF.get(_DIRECT_PLAY_CONF_KEYS[provider])
             and not _DIRECT_FILE_BINDINGS.matches(_direct_scope(request), guid)):
         return _direct_error(409, "range_identity_unavailable")
     if request.method == "HEAD":
@@ -9404,6 +9670,17 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
             if _lossless_is_blacklisted(guid):
                 fn_diag(logger, "lossless_downgrade", guid=guid, path="transcode_source", tier="mp3")
             return str(resolved["url"]), _lx_media_headers(resolved)
+        if source == "qqmusic":
+            force_std = _lossless_is_blacklisted(guid)
+            resolved_qq = await resolve_qqmusic_url(
+                get_qqmusic_client(request.app), song_id_from_online_guid(guid),
+                quality="standard" if force_std else None,
+                mode=CONF.get("quality_mode") or "high")
+            if not resolved_qq:
+                return None, None
+            if force_std:
+                fn_diag(logger, "lossless_downgrade", guid=guid, path="transcode_source", tier="mp3")
+            return str(resolved_qq[0]), dict(_qqmusic_cdn_headers())
         url = f"{str(CONF['musicdl_url']).rstrip('/')}/stream?id={quote(song_id_from_online_guid(guid))}&proxy=true"
         if _lossless_is_blacklisted(guid):
             # issue #46 音质降级：无损流损坏拉黑后降级 mp3，留档实际交付格式
@@ -10237,6 +10514,48 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                         return info
         except Exception as e:
             logger.warning("lxmusic /info failed for %s: %s", guid, e)
+        return None
+
+    if src == "qqmusic":
+        qq_client = get_qqmusic_client(request.app)
+        song_id = song_id_from_online_guid(guid)
+        try:
+            r = await qq_client.get(f"/api/v1/song/{quote(song_id)}/info", timeout=10.0)
+            if r.status_code != 200:
+                return None
+            res = r.json()
+            if not isinstance(res, dict) or res.get("ok") is False:
+                return None
+            data = res.get("data")
+            if not isinstance(data, dict):
+                return None
+            lyric_text = ""
+            if include_lyric:
+                try:
+                    lr = await qq_client.get(f"/api/v1/song/{quote(song_id)}/lyric", timeout=10.0)
+                    if lr.status_code == 200:
+                        l_res = lr.json()
+                        if isinstance(l_res, dict) and l_res.get("ok") is not False:
+                            l_data = l_res.get("data")
+                            if isinstance(l_data, dict):
+                                lyric_text = str(l_data.get("lyric") or "").strip()
+                except Exception as l_err:  # noqa: BLE001
+                    logger.warning("qqmusic lyric fetch in _online_info failed for %s: %s", guid, l_err)
+            quality = str(data.get("quality") or "").upper()
+            return {
+                "id": f"qqmusic:{song_id}",
+                "source": "qqmusic",
+                "title": str(data.get("song_name") or data.get("title") or ""),
+                "version": str(data.get("version") or ""),
+                "artist": str(data.get("artist") or ""),
+                "album": str(data.get("album_name") or data.get("album") or ""),
+                "cover_url": str(data.get("album_pic_url") or ""),
+                "duration_s": float(data.get("duration") or 0),
+                "ext": "flac" if "SQ" in quality else "mp3",
+                "lyric": lyric_text,
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.warning("qqmusic /info failed for %s: %s", guid, e)
         return None
 
     musicdl_client = get_musicdl_client(request.app)

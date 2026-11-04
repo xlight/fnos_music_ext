@@ -282,7 +282,7 @@ def test_put_rejects_multi_provider(env_file):
     with authed_client() as client:
         r = client.put("/api/config", json={"values": {"FNMUSIC_LX_ENABLED": "true"}})
         assert r.status_code == 400
-        assert "四选一" in r.json()["error"]
+        assert "五选一" in r.json()["error"]
 
 
 def test_put_rejects_zero_provider(env_file):

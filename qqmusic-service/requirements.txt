@@ -1,0 +1,5 @@
+# https://github.com/L-1124/QQMusicApi (PyPI: qqmusic-api-python)
+# 需要 Python >= 3.10
+qqmusic-api-python>=0.8.2
+fastapi>=0.110
+uvicorn>=0.29

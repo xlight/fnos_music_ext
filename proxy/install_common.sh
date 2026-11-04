@@ -520,6 +520,7 @@ native_code_or_env_newer() {
     for target in "${BASE_DIR}/.env" \
                   "${BASE_DIR}/musicdl-service" "${BASE_DIR}/musicbox-service" \
                   "${BASE_DIR}/lxmusic-service" "${BASE_DIR}/webui-service" \
+                  "${BASE_DIR}/qqmusic-service" \
                   "${BASE_DIR}/.lxserver"; do
         [ -e "${target}" ] || continue
         if [ -f "${target}" ]; then
