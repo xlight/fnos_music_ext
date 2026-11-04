@@ -3398,6 +3398,15 @@ def get_musicbox_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
+def get_neteasefree_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    """第四源免扫码网易客户端：与 musicbox 同款 /api/v1/* 契约，独立超时，默认关闭。"""
+    client = getattr(fastapi_app.state, "neteasefree_client", None)
+    if client is None:
+        client = httpx.AsyncClient(base_url=CONF["neteasefree_url"], timeout=20.0)
+        fastapi_app.state.neteasefree_client = client
+    return client
+
+
 def _active_netease_client(fastapi_app: FastAPI) -> httpx.AsyncClient | None:
     """网易系播放/歌词/取链运行期客户端：musicbox（含常驻）优先，其次第四源。
 

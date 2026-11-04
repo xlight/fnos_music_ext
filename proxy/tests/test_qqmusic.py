@@ -148,6 +148,22 @@ def test_direct_play_provider_excludes_qqmusic():
     assert _direct_provider_for_source("kuwo") == "musicdl"
 
 
+def test_all_source_client_providers_defined():
+    """每个音源的客户端 provider 必须存在。
+
+    回归：曾有提交误删 get_neteasefree_client，仅靠 import 发现不了，
+    要到运行期调健康检查/取链才报 NameError。
+    """
+    for name in (
+        "get_musicdl_client",
+        "get_musicbox_client",
+        "get_neteasefree_client",
+        "get_qqmusic_client",
+        "get_lx_client",
+    ):
+        assert callable(getattr(pa, name, None)), f"缺少音源客户端 provider: {name}"
+
+
 # =========================================================================
 # 搜索
 # =========================================================================
