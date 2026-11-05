@@ -99,6 +99,7 @@ def setup_nm_env(tmp_path, monkeypatch):
     # 关闭推荐注入，聚焦 nm 歌单行为（注入位置断言不依赖推荐构建链）
     monkeypatch.setitem(CONF, "recommend_hot", False)
     monkeypatch.setitem(CONF, "recommend_daily", False)
+    monkeypatch.setitem(CONF, "recommend_charts", False)
     yield
     nmpl.reset_for_test()
 

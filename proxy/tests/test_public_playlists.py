@@ -65,6 +65,7 @@ def setup_env(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
     monkeypatch.setitem(CONF, "recommend_hot", False)
     monkeypatch.setitem(CONF, "recommend_daily", False)
+    monkeypatch.setitem(CONF, "recommend_charts", False)
     monkeypatch.setitem(CONF, "netease_enabled", True)
     monkeypatch.setitem(CONF, "netease_my_playlists", False)
     monkeypatch.setitem(CONF, "netease_playlist_resident", False)

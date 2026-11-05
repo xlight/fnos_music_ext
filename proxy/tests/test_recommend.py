@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from proxy import recommend as dailyrec
+from proxy import charts as chartrec
 from proxy.app import CONF, _DAILY_TASKS, _SEARCH_CACHE, app, _conf_log_value, fake_official_guid
 from proxy.app import resolve_real_guid, save_online_favorites
 
@@ -1074,10 +1075,16 @@ def test_playlist_list_injects_both_playlists_with_disguised_cover(tmp_path, mon
         assert resp.status_code == 200
         data = resp.json()["data"]
         recs = [it for it in data["list"] if dailyrec.is_recommend_playlist_guid(str(it.get("guid") or ""))]
-        assert len(recs) == 2
+        # 内置榜单（kind=chart）也会注入；本用例只断言 daily/hot 两条
+        non_chart = [it for it in recs
+                     if dailyrec.online_playlist_kind(str(it.get("guid") or "")) != "chart"]
+        assert len(non_chart) == 2
+        charts = [it for it in recs
+                  if dailyrec.online_playlist_kind(str(it.get("guid") or "")) == "chart"]
+        assert len(charts) == len(chartrec.ALL_CHARTS)  # 38 榜默认全开
         assert data["total"] == len(data["list"])
-        daily = next(it for it in recs if dailyrec.online_playlist_kind(str(it["guid"])) == "daily")
-        hot = next(it for it in recs if dailyrec.online_playlist_kind(str(it["guid"])) == "hot")
+        daily = next(it for it in non_chart if dailyrec.online_playlist_kind(str(it["guid"])) == "daily")
+        hot = next(it for it in non_chart if dailyrec.online_playlist_kind(str(it["guid"])) == "hot")
         assert "每日推荐" in daily["name"]
         assert hot["name"] == "热门推荐"
         # coverId 伪装为官方形态（track_ + 32hex），且可反解回第一个有封面的歌
@@ -1199,7 +1206,8 @@ def test_playlist_list_daily_isolated_between_users(tmp_path, monkeypatch):
     app.state.upstream_client = httpx.AsyncClient(transport=_switchable_auth(current), base_url="http://unix")
     with TestClient(app) as client:
         resp_a = client.get("/music/api/v1/playlist/list").json()
-        recs_a = [it for it in resp_a["data"]["list"] if dailyrec.is_recommend_playlist_guid(str(it.get("guid") or ""))]
+        recs_a = [it for it in resp_a["data"]["list"] if dailyrec.is_recommend_playlist_guid(str(it.get("guid") or ""))
+                  and dailyrec.online_playlist_kind(str(it.get("guid") or "")) != "chart"]
         assert [it["guid"] for it in recs_a] == [guid_a]
         assert recs_a[0]["trackCount"] == 2
 
@@ -1208,7 +1216,8 @@ def test_playlist_list_daily_isolated_between_users(tmp_path, monkeypatch):
 
         current["guid"] = "user-b"
         resp_b = client.get("/music/api/v1/playlist/list").json()
-        recs_b = [it for it in resp_b["data"]["list"] if dailyrec.is_recommend_playlist_guid(str(it.get("guid") or ""))]
+        recs_b = [it for it in resp_b["data"]["list"] if dailyrec.is_recommend_playlist_guid(str(it.get("guid") or ""))
+                  and dailyrec.online_playlist_kind(str(it.get("guid") or "")) != "chart"]
         assert [it["guid"] for it in recs_b] == [guid_b]
 
         tracks_b = client.get("/music/api/v1/track/playlist-detail/list", params={"playlistGUID": guid_b, "page": 1, "size": 50}).json()
@@ -1844,3 +1853,157 @@ def test_playlist_size_env_configurable(monkeypatch):
         monkeypatch.delenv("FNMUSIC_RECOMMEND_SIZE")
         importlib.reload(rec_mod)
     assert rec_mod.PLAYLIST_SIZE == 20
+
+
+def test_chart_playlists_injected_in_list_detail_and_tracks(tmp_path, monkeypatch):
+    """内置榜单歌单：list 注入全部启用榜单卡片，detail/track-list 走 chart 缓存，
+    白名单与总开关可收敛/关闭注入。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path))
+    chartrec._MEM_CACHE.clear()
+    monkeypatch.setitem(CONF, "recommend_daily", False)
+    monkeypatch.setitem(CONF, "recommend_hot", False)
+    monkeypatch.setitem(CONF, "recommend_charts", True)
+    monkeypatch.setitem(CONF, "kg_charts", True)
+    monkeypatch.setitem(CONF, "wy_charts", True)
+    monkeypatch.setitem(CONF, "enabled_charts", "")
+
+    cid = chartrec.KG_CHARTS[0]["id"]
+    day = chartrec._today()
+    seed_tracks = [
+        {"guid": f"online:kg:{cid}-{i}", "title": f"榜歌{i}", "artist": "歌手", "album": "专辑"}
+        for i in range(3)
+    ]
+    chartrec.save_chart_cache(cid, day, seed_tracks, cover_url="http://x/c.jpg")
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(_auth_user()), base_url="http://unix")
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8768"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8770"
+    )
+    g = chartrec.chart_guid(cid)
+    with TestClient(app) as client:
+        # 1) list：注入全部 38 榜卡片
+        data = client.get("/music/api/v1/playlist/list").json()["data"]
+        cards = [it for it in data["list"]
+                 if dailyrec.online_playlist_kind(str(it.get("guid") or "")) == "chart"]
+        assert len(cards) == len(chartrec.ALL_CHARTS)
+        assert g in {str(c.get("guid")) for c in cards}
+        card = next(c for c in cards if str(c.get("guid")) == g)
+        assert card["trackCount"] == 3  # 当日缓存 3 首
+        assert str(card["coverId"]).startswith("track_")
+
+        # 2) detail：chart guid 分支返回卡片 + 实际曲目数
+        det = client.get("/music/api/v1/playlist/detail", params={"guid": g}).json()
+        assert det["code"] == 0
+        assert det["data"]["guid"] == g
+        assert det["data"]["trackCount"] == 3
+
+        # 3) track-list：chart guid 分支分页下发缓存曲目
+        tl = client.get("/music/api/v1/track/playlist-detail/list",
+                        params={"playlistGUID": g, "page": 1, "size": 50}).json()
+        assert tl["code"] == 0
+        assert tl["data"]["total"] == 3
+        assert len(tl["data"]["list"]) == 3
+        assert tl["data"]["list"][0]["title"] == "榜歌0"
+
+        # 4) 白名单收敛：只保留一个不存在的 id → 无榜单卡片，detail 返回 not found
+        monkeypatch.setitem(CONF, "enabled_charts", "wy_not_exist")
+        data2 = client.get("/music/api/v1/playlist/list").json()["data"]
+        cards2 = [it for it in data2["list"]
+                  if dailyrec.online_playlist_kind(str(it.get("guid") or "")) == "chart"]
+        assert cards2 == []
+        det2 = client.get("/music/api/v1/playlist/detail", params={"guid": g}).json()
+        assert det2["code"] == -1
+        tl2 = client.get("/music/api/v1/track/playlist-detail/list",
+                         params={"playlistGUID": g, "page": 1, "size": 50}).json()
+        assert tl2["code"] == -1
+
+        # 5) 总开关关闭：不再注入任何榜单卡片
+        monkeypatch.setitem(CONF, "enabled_charts", "")
+        monkeypatch.setitem(CONF, "recommend_charts", False)
+        data3 = client.get("/music/api/v1/playlist/list").json()["data"]
+        cards3 = [it for it in data3["list"]
+                  if dailyrec.online_playlist_kind(str(it.get("guid") or "")) == "chart"]
+        assert cards3 == []
+
+
+@pytest.mark.anyio
+async def test_hot_falls_back_to_builtin_chart_cache(tmp_path, monkeypatch):
+    """音源全挂（netease/lx 关闭）时，热门推荐降级内置榜单缓存（charts.py 当日榜）。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_CHARTS", "true")
+    monkeypatch.setenv("FNMUSIC_KG_CHARTS", "true")
+    monkeypatch.setenv("FNMUSIC_WY_CHARTS", "true")
+    monkeypatch.setenv("FNMUSIC_ENABLED_CHARTS", "")
+    chartrec._MEM_CACHE.clear()
+
+    cid = chartrec.KG_CHARTS[0]["id"]
+    rows = [
+        {
+            "id": f"lx:kg:B{i}", "source": "lx", "title": f"内置榜歌{i}",
+            "artist": f"榜歌手{i}", "album": "", "duration_s": 200,
+            "ext": "mp3", "cover_url": "http://x/c.jpg",
+        }
+        for i in range(25)
+    ]
+    chartrec.save_chart_cache(cid, chartrec._today(), rows, cover_url="http://x/c.jpg")
+
+    from proxy.app import build_online_track
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8770"
+    ) as mb:
+        payload = await dailyrec.get_or_build_daily(
+            user_guid="u-builtin-charts",
+            musicdl_client=None,
+            musicbox_client=mb,
+            llm_http=None,
+            build_track=build_online_track,
+            netease_enabled=False,   # 音源关闭：netease/lx 两级都不可用
+            lx_client=None,
+            lx_enabled=False,
+            kind="hot",
+        )
+    assert payload["kind"] == "hot"
+    assert payload["tiers"] == ["builtin-charts"]
+    assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
+    assert all(str(t["guid"]).startswith("online:lx:kg:") for t in payload["tracks"])
+    assert any("内置榜歌" in str(t["title"]) for t in payload["tracks"])
+
+
+@pytest.mark.anyio
+async def test_hot_builtin_charts_respects_charts_switch(tmp_path, monkeypatch):
+    """FNMUSIC_RECOMMEND_CHARTS=false 时内置榜单兜底不生效，热门为空歌单。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_CHARTS", "false")
+    chartrec._MEM_CACHE.clear()
+    cid = chartrec.KG_CHARTS[0]["id"]
+    chartrec.save_chart_cache(
+        cid, chartrec._today(),
+        [{"id": "lx:kg:B0", "source": "lx", "title": "x", "artist": "y", "duration_s": 100, "ext": "mp3"}],
+    )
+
+    from proxy.app import build_online_track
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8770"
+    ) as mb:
+        payload = await dailyrec.get_or_build_daily(
+            user_guid="u-no-charts",
+            musicdl_client=None,
+            musicbox_client=mb,
+            llm_http=None,
+            build_track=build_online_track,
+            netease_enabled=False,
+            lx_client=None,
+            lx_enabled=False,
+            kind="hot",
+        )
+    assert payload["kind"] == "hot"
+    assert payload["tiers"] == []
+    assert payload["tracks"] == []

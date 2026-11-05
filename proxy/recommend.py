@@ -9,8 +9,9 @@
       3. local-random   本地曲库随机兜底（只读官方库；按账户播放历史选
                         "从未听过优先、最久未听补齐"的本地现存曲目，各账户不同）
   - 热门推荐（hot，FNMUSIC_RECOMMEND_HOT）：榜单原味（不排除已收藏/最近播放）：
-      1. netease-charts 网易热歌榜（musicbox toplist，免登录）
-      2. lx-charts      lxmusic 免登录榜单（kg TOP500 / kw 飙升榜 / wy 新歌速递）
+       1. netease-charts  网易热歌榜（musicbox toplist，免登录）
+       2. lx-charts       lxmusic 免登录榜单（kg TOP500 / kw 飙升榜 / wy 新歌速递）
+       3. builtin-charts  内置榜单缓存兜底（charts.py 的 kg/wy 当日榜），音源不可用时仍有内容
 猜你喜欢（liked）由 localrecommend 独立计算；可显式启用大模型，数量为 0 时隐藏。
 歌单使用自身 ID 请求封面，封面接口从缓存曲目选取有限候选并提供占位回退。
 密钥只从环境变量读取，绝不写入 CONF / 日志 / 缓存。
@@ -39,6 +40,11 @@ try:
 except ImportError:  # 直跑场景（非包导入）
     import llm_usage
 
+try:
+    from . import charts as chartrec
+except ImportError:  # 直跑场景（非包导入）
+    import charts as chartrec
+
 logger = logging.getLogger("fnmusic_proxy.recommend")
 
 DAILY_GUID_PREFIX = "online:playlist:daily:"
@@ -58,6 +64,13 @@ SEED_LIMIT = 20
 DEFAULT_PROTOCOL = "chat"
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_DAILY_TOKEN_LIMIT = 1_000_000
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("true", "1", "yes")
 
 
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
@@ -2358,6 +2371,33 @@ async def get_or_build_daily(
         return resolve_source_candidates(
             day_shifted(items, day, "lx-charts"), build_track, target_size, exclude_guids, exclude_ta)
 
+    async def from_builtin_charts(on_track=None, should_stop=None) -> list[dict]:
+        # 内置榜单缓存兜底（charts.py 的 kg/wy 当日榜缓存，已预热落盘）：
+        # 音源（musicbox/lx）不可用时，热门推荐仍可由内置榜单填充
+        if not (recommend_hot and _env_bool("FNMUSIC_RECOMMEND_CHARTS", True)):
+            return []
+        metas = chartrec.list_enabled_charts(
+            enable_charts=True,
+            enable_kg=_env_bool("FNMUSIC_KG_CHARTS", True),
+            enable_wy=_env_bool("FNMUSIC_WY_CHARTS", True),
+            custom_whitelist=os.environ.get("FNMUSIC_ENABLED_CHARTS", ""),
+        )
+        items: list[dict] = []
+        for meta in metas:
+            if should_stop and should_stop():
+                break
+            cid = str(meta.get("id") or "")
+            if not cid:
+                continue
+            cached = chartrec.load_chart_cache(cid, day) or []
+            items.extend(cached)
+            if len(items) >= CHART_FETCH_COUNT * 3:
+                break
+        if not items:
+            return []
+        return resolve_source_candidates(
+            day_shifted(items, day, "builtin-charts"), build_track, target_size, exclude_guids, exclude_ta)
+
     async def from_llm(on_track=None, should_stop=None) -> list[dict]:
         # 明确启用时所有用户的第一优先级；否则作为网易日推不可用后的个人化补充。
         if llm_http is None or not llm_daily_enabled() or not recommend_daily:
@@ -2520,11 +2560,12 @@ async def get_or_build_daily(
     # 每日推荐链（按账户隔离）：LLM 明确启用且接口完整时所有用户优先生成个人
     # 推荐；否则网易真每日推荐（每天仅第一个用户，占用音源名额）-> LLM ->
     # 本地曲库随机兜底（最近没听过优先）；
-    # 热门推荐链：网易热歌榜 -> lx 免登录榜单。每级不足 20 首由下一级补齐。
+    # 热门推荐链：网易热歌榜 -> lx 免登录榜单 -> 内置榜单缓存兜底。每级不足由下一级补齐。
     # FNMUSIC_RECOMMEND_DAILY / FNMUSIC_RECOMMEND_HOT 分别门控两条链的构建。
     if kind == "hot":
         await run_tier("netease-charts", from_netease_charts)
         await run_tier("lx-charts", from_lx_charts)
+        await run_tier("builtin-charts", from_builtin_charts)
     elif recommend_daily:
         if strategy != "llm-personal" and not source_slot_claimed(day):
             await run_tier("netease-daily", from_netease_daily)

@@ -27,6 +27,7 @@ def library(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "music_db", str(db))
     monkeypatch.setitem(CONF, "recommend_daily", False)
     monkeypatch.setitem(CONF, "recommend_hot", False)
+    monkeypatch.setitem(CONF, "recommend_charts", False)
     monkeypatch.setitem(CONF, "netease_my_playlists", False)
     monkeypatch.setitem(CONF, "public_playlists_enabled", False)
     monkeypatch.setattr(localrec.time, "time", lambda: NOW)

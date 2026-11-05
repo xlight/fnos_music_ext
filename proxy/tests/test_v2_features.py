@@ -334,6 +334,10 @@ async def test_daily_off_keeps_hot_charts(tmp_path, monkeypatch):
     """仅关“每日”（开着榜单）：热门歌单正常打 toplist，daily 链不请求。"""
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
     monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
+    # 关闭内置榜单兜底 tier，保持"toplist 为空则热门为空"的断言语义
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_CHARTS", "false")
+    from proxy import charts as _chartrec
+    _chartrec._MEM_CACHE.clear()
     paths = []
 
     def mb_handler(request: httpx.Request) -> httpx.Response:

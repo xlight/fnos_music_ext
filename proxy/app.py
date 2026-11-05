@@ -11954,6 +11954,20 @@ def _recommend_kind_enabled(kind: str) -> bool:
     return bool(CONF.get("recommend_daily", True))
 
 
+def _enabled_chart_metas() -> list[dict]:
+    """按开关/白名单返回要注入的内置榜单（酷狗/网易，charts.py 目录）。"""
+    return chartrec.list_enabled_charts(
+        enable_charts=bool(CONF.get("recommend_charts", True)),
+        enable_kg=bool(CONF.get("kg_charts", True)),
+        enable_wy=bool(CONF.get("wy_charts", True)),
+        custom_whitelist=str(CONF.get("enabled_charts") or ""),
+    )
+
+
+def _enabled_chart_ids() -> set[str]:
+    return {str(m.get("id") or "") for m in _enabled_chart_metas()} - {""}
+
+
 def _recommend_kinds_enabled() -> list[str]:
     """按开关返回要注入的推荐歌单类型（顺序即歌单列表顺序）。"""
     return [k for k in ("daily", "liked", "hot", "category", "custom") if _recommend_kind_enabled(k)]
@@ -12701,6 +12715,23 @@ async def playlist_list(request: Request):
         recs.append(rec)
         if kind == "liked" and tracks:
             consumed_liked = bundle
+    chart_cards: list[dict] = []
+    if bool(CONF.get("recommend_charts", True)):
+        # 内置榜单歌单（kg/wy）：数据层（抓取/缓存/预热）已就绪，这里注入卡片
+        day = dailyrec.today_key()
+        for meta in _enabled_chart_metas():
+            cid = str(meta.get("id") or "")
+            if not cid:
+                continue
+            try:
+                cached = chartrec.load_chart_cache(cid, day) or []
+                card = chartrec.build_chart_playlist_record(cid, len(cached))
+                g = str(card.get("guid") or "")
+                if g:
+                    fake_official_guid(g)
+                chart_cards.append(card)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("chart %s list inject failed: %s", cid, e)
     public_cards: list[dict] = []
     if public_on:
         try:
@@ -12738,9 +12769,9 @@ async def playlist_list(request: Request):
         it for it in official
         if not (isinstance(it, dict) and dailyrec.is_recommend_playlist_guid(str(it.get("guid") or "")))
     ]
-    data["list"] = recs + public_cards + nm_cards + official
+    data["list"] = recs + chart_cards + public_cards + nm_cards + official
     total = data.get("total")
-    data["total"] = (total if isinstance(total, int) else len(official)) + len(recs) + len(public_cards) + len(nm_cards)
+    data["total"] = (total if isinstance(total, int) else len(official)) + len(recs) + len(chart_cards) + len(public_cards) + len(nm_cards)
     response = JSONResponse(content=envelope, headers=headers)
     if consumed_liked is not None:
         _mark_liked_response_fetched(user_guid, consumed_liked)
@@ -12780,6 +12811,33 @@ async def playlist_detail(request: Request):
             card = {**card, "trackCount": len(tracks)}
         return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
     kind = dailyrec.online_playlist_kind(guid)
+    if kind == "chart":
+        # 内置榜单歌单详情：卡片 + 曲目数（曲目走 playlist-detail/list）
+        cid = chartrec.chart_id_from_guid(guid)
+        if not cid or cid not in _enabled_chart_ids():
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        try:
+            limit = max(10, min(200, int(CONF.get("chart_limit") or 100)))
+            tracks = await chartrec.get_or_load_chart_tracks(
+                cid,
+                netease_enabled=bool(CONF.get("netease_enabled")),
+                neteasefree_enabled=bool(CONF.get("neteasefree_enabled")),
+                limit=limit,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("chart %s detail failed: %s", cid, e)
+            tracks = []
+        tracks = dailyrec.stamp_playlist_tracks(tracks)
+        register_online_meta(tracks)
+        card = chartrec.build_chart_playlist_record(cid, len(tracks))
+        fake_official_guid(guid)
+        rec = _playlist_public_fields(card, tracks)
+        rec["trackCount"] = len(tracks)
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
     if kind == "category":
         # 任务 3.1：分类歌单详情（按类按天缓存，未启用分类返回无歌单）。
         upstream_client = get_upstream_client(request.app)
@@ -12912,6 +12970,14 @@ async def playlist_batch_detail(request: Request):
     consumed_liked = []
     for g in recommend_ids:
         kind = dailyrec.online_playlist_kind(g) or "daily"
+        if kind == "chart":
+            cid = chartrec.chart_id_from_guid(g)
+            if cid and cid in _enabled_chart_ids():
+                cached = chartrec.load_chart_cache(cid, dailyrec.today_key()) or []
+                card = chartrec.build_chart_playlist_record(cid, len(cached))
+                fake_official_guid(str(card.get("guid") or ""))
+                recs.append(_playlist_public_fields(card, cached))
+            continue
         if kind == "category":
             cid = (g.split(":", 3)[-1].split(":")[0] if g.startswith(dailyrec.CATEGORY_GUID_PREFIX) else "")
             bundle = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), "category", cid)
@@ -13049,6 +13115,49 @@ async def playlist_track_list(request: Request):
                 "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
             })
         )
+    if kind == "chart":
+        # 内置榜单歌单曲目：优先当日缓存，无则抓取落盘（charts.py），分页下发
+        cid = chartrec.chart_id_from_guid(guid)
+        if not cid or cid not in _enabled_chart_ids():
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        try:
+            limit = max(10, min(200, int(CONF.get("chart_limit") or 100)))
+            tracks = await chartrec.get_or_load_chart_tracks(
+                cid,
+                netease_enabled=bool(CONF.get("netease_enabled")),
+                neteasefree_enabled=bool(CONF.get("neteasefree_enabled")),
+                limit=limit,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("chart %s tracks failed: %s", cid, e)
+            return JSONResponse(content={"code": -1, "msg": "chart load failed", "data": None})
+        tracks = dailyrec.stamp_playlist_tracks(tracks)
+        register_online_meta(tracks)
+        try:
+            page = max(int(request.query_params.get("page") or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            size = int(request.query_params.get("size") or 50)
+        except (TypeError, ValueError):
+            size = 50
+        if size == -1:
+            size = max(len(tracks), 1)
+        if size < 1:
+            size = 50
+        start = (page - 1) * size
+        page_tracks = _stamp_online_favorite_state(
+            tracks[start:start + size],
+            await _online_favorite_set_for_user(user_guid),
+        )
+        return JSONResponse(content=disguise_client_json({
+            "code": 0, "msg": "ok",
+            "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
+        }))
     if kind == "category":
         # 任务 3.1：分类歌单曲目（按类按天缓存分页下发）。
         upstream_client = get_upstream_client(request.app)
