@@ -21,6 +21,9 @@ bind_registry.json
 # LLM token 账本（运行数据，包含调用统计和失败信息）
 llm_usage.json
 llm_usage.json.*
+# 整曲补全记录账本（运行数据，含听歌历史；损坏时隔离成 .corrupt-*）
+completion_log.json
+completion_log.json.*
 playlist_tracks/
 __pycache__/
 *.pyc

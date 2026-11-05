@@ -111,6 +111,7 @@ rsync -a --delete \
     --exclude='recommend_cache/' --exclude='public_playlists_cache/' --exclude='play_history/' \
     --exclude='online_favorites/' --exclude='online_favorites.json' \
     --exclude='llm_usage.json' --exclude='llm_usage.json.*' \
+    --exclude='completion_log.json' --exclude='completion_log.json.*' \
     --exclude='playlist_tracks/' --exclude='album_registry.json' --exclude='bind_registry.json' \
     --exclude='*.fpk' \
     "${REPO_ROOT}/" "${STAGE}/app/repo/"

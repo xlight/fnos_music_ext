@@ -139,3 +139,21 @@
 
 > 编号 50（LivePOO）、53（zhuolin）、54（LiziYY）、56（ITingWa）已随上游 musicdl 2.13.11 / 2.14.1 移除而退役：编号永久空缺、不复用。
 > 此后新增平台一律从表末最大编号 +1 追加（如 64 = yinyueku、65–67 = gequke/leedodo/heishan）。
+
+## 整曲补全（音源适配器）
+
+- 账号型音源（网易盒子 / 免扫码）给不出完整曲时（VIP 无权益、版权下架、上游只给 30s 试听），
+  代理可在其它已启用音源里按「歌名 歌手」再搜一轮并 307 替换播放（整曲补全）。
+- 机制是「**音源适配器 + 通用引擎**」：适配器只承载音源特有的判定（为什么不能整曲播放）
+  与元数据获取，键是 guid 源前缀（当前注册：`netease`）。未来接入新的账号型音源
+  （如 QQ 音乐）只需在 `proxy/app.py` 的 `_COMPLETION_ADAPTERS` 注册一个适配器，
+  配置 / 总开关 / 补全记录零改动。
+- 总开关 `FNMUSIC_FALLBACK_ENABLED`（默认 **false**，管理台可开）：只停用跨源替换，
+  不影响试听拦截（试听片段永远不会被当作全曲交付）。
+- 补全记录落在 `<FNMUSIC_HOME>/completion_log.json`（有界 200 条），管理台「补全记录」
+  列表与概览摘要可查；reason 分两层——触发原因（`preview_rejected` / `vip_unavailable` /
+  `resolve_failed`）与跳过原因（`switch_off` / `musicdl_disabled` / `meta_missing` /
+  `pin_dropped` / `cooldown` / `no_items` / `search_timeout` / `empty_result`）。
+- 同一录音的精确匹配未来用 **ISRC**（本地曲库 `tracks.isrc` 已有该列；社区另一套身份是
+  MusicBrainz MBID，本地暂无）。当前挑选仍是标题+歌手+时长启发式（与 UnblockNeteaseMusic
+  同款做法）。

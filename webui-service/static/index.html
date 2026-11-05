@@ -38,12 +38,14 @@
         <button class="nav-item active" data-page="overview" type="button"><svg class="icon" aria-hidden="true"><use href="#i-overview"/></svg><span>概览</span></button>
         <button class="nav-item" data-page="source" type="button"><svg class="icon" aria-hidden="true"><use href="#i-source"/></svg><span>音乐源</span></button>
         <button class="nav-item" data-page="quality" type="button"><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg><span>播放与推荐</span></button>
+         <button class="nav-item" data-page="playlist" type="button">歌单</button>
         <div class="nav-group">
           <button class="nav-item nav-group-title" id="nav-storage-title" type="button" aria-expanded="false" aria-controls="nav-storage-subs">
             <svg class="icon" aria-hidden="true"><use href="#i-storage"/></svg><span>储存</span><span class="nav-arrow" aria-hidden="true">▾</span>
           </button>
           <div class="nav-group-subs" id="nav-storage-subs" hidden>
             <button class="nav-item nav-sub" data-page="tee" type="button"><span>边听边存</span></button>
+            <button class="nav-item nav-sub" data-page="completion" type="button"><span>整曲补全</span></button>
             <button class="nav-item nav-sub" data-page="dirs" type="button"><span>目录设置</span></button>
           </div>
         </div>
@@ -92,6 +94,13 @@
         <div class="card" id="ov-lx-card" hidden>
           <div class="card-title">洛雪源运行摘要</div>
           <div id="ov-lx" class="stack"></div>
+        </div>
+        <div class="card" id="ov-completion-card" hidden>
+          <div class="card-title">最近补全（近 200 次内）</div>
+          <div id="ov-completion" class="stack"></div>
+          <div class="btn-row">
+            <button class="btn small" id="ov-completion-open" type="button">查看全部</button>
+          </div>
         </div>
       </section>
 
@@ -591,6 +600,7 @@
       </button>
       <div class="bottom-sub-menu" id="bottom-storage-menu" role="menu" hidden>
         <button class="bottom-sub-item" data-page="tee" role="menuitem" type="button">边听边存</button>
+        <button class="nav-item" data-page="completion" role="menuitem" type="button">整曲补全</button>
         <button class="bottom-sub-item" data-page="dirs" role="menuitem" type="button">目录设置</button>
       </div>
     </div>
