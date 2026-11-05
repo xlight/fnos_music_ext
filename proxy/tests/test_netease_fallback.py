@@ -63,6 +63,7 @@ def _isolated(monkeypatch, tmp_path):
     p._NETEASE_URL_PIN.clear()
     p.reset_source_search_gates()
     monkeypatch.setitem(CONF, "cache_dir", str(tmp_path / "cache"))
+    monkeypatch.setenv("FNMUSIC_COMPLETION_LOG_FILE", str(tmp_path / "completion_log.json"))
     monkeypatch.setitem(CONF, "library_dir", str(tmp_path / "library"))
     monkeypatch.setitem(CONF, "fav_dir", str(tmp_path / "fav"))
     monkeypatch.setitem(CONF, "music_db", str(tmp_path / "music.db"))
@@ -72,6 +73,7 @@ def _isolated(monkeypatch, tmp_path):
     monkeypatch.setitem(CONF, "lx_enabled", False)
     monkeypatch.setitem(CONF, "netease_direct_play", False)
     monkeypatch.setitem(CONF, "musicdl_direct_play", False)
+    monkeypatch.setitem(CONF, "fallback_enabled", True)   # 本文件测"开启时"的补全路径
     monkeypatch.setitem(CONF, "online_sources", "KuwoMusicClient")
     monkeypatch.setitem(CONF, "online_limit", 30)
     monkeypatch.setitem(CONF, "fallback_timeout", 6.0)
@@ -122,7 +124,7 @@ async def test_fallback_search_returns_first_musicdl_guid(monkeypatch):
     req = _request()
     retained: dict = {}
 
-    guid = await p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦",
+    guid = await p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦",
                                             entry=retained)
 
     assert guid == FALLBACK_GUID
@@ -243,7 +245,7 @@ async def test_fallback_search_returns_matching_title_item(monkeypatch):
     _patch_fetch(monkeypatch, {"items": items})
     req = _request()
 
-    guid = await p._netease_fallback_search(req, NETEASE_GUID, "天龙八部之宿敌", "许嵩",
+    guid = await p._completion_search(req, NETEASE_GUID, "天龙八部之宿敌", "许嵩",
                                             duration_s=263.0)
     assert guid == "online:kuwo:12"
 
@@ -264,11 +266,11 @@ async def test_fallback_search_passes_grace_override(monkeypatch):
 
     monkeypatch.setattr(p, "fetch_musicdl_search", _fetch)
 
-    await p._netease_fallback_search(_request(), NETEASE_GUID, "晴天", "周杰伦")
+    await p._completion_search(_request(), NETEASE_GUID, "晴天", "周杰伦")
     assert graces == [8.0]
 
     monkeypatch.setitem(CONF, "fallback_grace_s", 0.0)
-    await p._netease_fallback_search(_request(), NETEASE_GUID, "夜曲", "周杰伦")
+    await p._completion_search(_request(), NETEASE_GUID, "夜曲", "周杰伦")
     assert graces == [8.0, 0.0]
 
 
@@ -289,11 +291,11 @@ async def test_fallback_search_uses_configured_limit(monkeypatch):
     monkeypatch.setattr(p, "fetch_musicdl_search", _fetch)
     req = _request()
 
-    await p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦")
+    await p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦")
     assert limits == [5]
 
     monkeypatch.setitem(CONF, "fallback_limit", 12)
-    await p._netease_fallback_search(req, NETEASE_GUID, "夜曲", "周杰伦")
+    await p._completion_search(req, NETEASE_GUID, "夜曲", "周杰伦")
     assert limits == [5, 12]
 
 
@@ -305,8 +307,8 @@ async def test_fallback_search_reads_cache_before_searching(monkeypatch):
     _patch_fetch(monkeypatch, {"items": [_item()]}, calls)
     req = _request()
 
-    first = await p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦")
-    second = await p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦")
+    first = await p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦")
+    second = await p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦")
 
     assert first == second == FALLBACK_GUID
     assert calls == ["晴天 周杰伦"]  # 第二次命中缓存，未再搜
@@ -321,8 +323,8 @@ async def test_fallback_cache_isolated_per_credential_scope(monkeypatch):
     req_a = _request()
     req_b = _request(headers={"cookie": "session=someone-else"})
 
-    await p._netease_fallback_search(req_a, NETEASE_GUID, "晴天", "周杰伦")
-    await p._netease_fallback_search(req_b, NETEASE_GUID, "晴天", "周杰伦")
+    await p._completion_search(req_a, NETEASE_GUID, "晴天", "周杰伦")
+    await p._completion_search(req_b, NETEASE_GUID, "晴天", "周杰伦")
 
     assert len(calls) == 2
     keys = [k for k in p._SEARCH_CACHE if k.startswith("netease-fallback:")]
@@ -338,7 +340,7 @@ async def test_fallback_search_respects_cooldown(monkeypatch):
     req = _request()
     retained = {"fallback:netease": time.monotonic()}
 
-    assert await p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦",
+    assert await p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦",
                                             entry=retained) is None
     assert calls == []
 
@@ -352,7 +354,7 @@ async def test_fallback_search_budget_clamped_to_remaining(monkeypatch):
     req = _request()
 
     started = time.monotonic()
-    assert await p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦",
+    assert await p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦",
                                             budget=0.5) is None
     assert time.monotonic() - started < 2.0
 
@@ -363,7 +365,7 @@ async def test_fallback_search_without_result_returns_none(monkeypatch):
     _patch_fetch(monkeypatch, {"items": []})
     req = _request()
 
-    assert await p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦") is None
+    assert await p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦") is None
 
 
 @pytest.mark.anyio
@@ -374,7 +376,7 @@ async def test_fallback_search_timeout_returns_none(monkeypatch):
     req = _request()
 
     started = time.monotonic()
-    assert await p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦") is None
+    assert await p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦") is None
     assert time.monotonic() - started < 3.0
 
 
@@ -394,8 +396,8 @@ async def test_fallback_search_single_flight_queries_upstream_once(monkeypatch):
         monkeypatch.setattr(p, "get_musicdl_client", lambda a: client)
         req = _request()
         results = await asyncio.gather(
-            p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦"),
-            p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦"),
+            p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦"),
+            p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦"),
         )
 
     assert hits == ["/search"]
@@ -422,7 +424,7 @@ async def test_fallback_search_and_recover_source_do_not_supersede(monkeypatch):
         req = _request()
         entry = {"keyword": "夜曲", "ts": time.time()}
         fallback, recovered = await asyncio.gather(
-            p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦"),
+            p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦"),
             p._recover_source(req, "online:kuwo:9", entry),
         )
 
@@ -439,7 +441,7 @@ async def test_fallback_entry_is_retained_after_write(monkeypatch):
     _patch_fetch(monkeypatch, {"items": [_item()]})
     req = _request()
 
-    guid = await p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦")
+    guid = await p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦")
     item, entry = p._retained_track(req, guid)
 
     assert guid == FALLBACK_GUID
@@ -676,8 +678,8 @@ async def test_two_tracks_fallback_searches_do_not_supersede(monkeypatch):
         monkeypatch.setattr(p, "get_musicdl_client", lambda a: client)
         req = _request()
         first, second = await asyncio.gather(
-            p._netease_fallback_search(req, NETEASE_GUID, "晴天", "周杰伦"),
-            p._netease_fallback_search(req, NETEASE_GUID, "夜曲", "周杰伦"),
+            p._completion_search(req, NETEASE_GUID, "晴天", "周杰伦"),
+            p._completion_search(req, NETEASE_GUID, "夜曲", "周杰伦"),
         )
 
     assert first == FALLBACK_GUID
@@ -764,6 +766,76 @@ async def test_stream_fallback_skipped_when_metadata_missing(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_stream_fallback_disabled_by_switch(monkeypatch):
+    """任务 1.4：总开关关闭时不发起补全搜索、返回 404，并打出 switch_off 诊断。"""
+    p = importlib.import_module("proxy.app")
+    monkeypatch.setitem(CONF, "fallback_enabled", False)
+    calls: list[str] = []
+    _patch_fetch(monkeypatch, {"items": [_item()]}, calls)
+    monkeypatch.setattr(p, "_online_meta_for_request", lambda *a: {"title": "晴天", "artist": "周杰伦"})
+    diags: list[tuple] = []
+    monkeypatch.setattr(p, "fn_diag", lambda logger, event, **fields: diags.append((event, fields)))
+
+    async def fake_open(request, guid, range_header, **kwargs):
+        return None
+
+    monkeypatch.setattr(p, "_open_online_stream", fake_open)
+
+    response = await p.stream_track(_request())
+
+    assert response.status_code == 404
+    assert calls == []                                  # 未发起任何补全搜索
+    assert ("completion_skip", {"guid": NETEASE_GUID, "reason": "switch_off",
+                                "provider": "netease", "song_id": "123"}) in diags
+    # 旧名同义别名并行一轮（字段与值相同）
+    assert ("netease_fallback_skip", {"guid": NETEASE_GUID, "reason": "switch_off",
+                                      "provider": "netease", "song_id": "123"}) in diags
+
+
+@pytest.mark.anyio
+async def test_stream_fallback_writes_completion_record(monkeypatch, tmp_path):
+    """任务 1.4/1.6：补全命中要写账本记录（hit + 触发原因），且跳过分支也要写 skip 记录。"""
+    p = importlib.import_module("proxy.app")
+    ledger = tmp_path / "completion_log.json"
+    monkeypatch.setenv("FNMUSIC_COMPLETION_LOG_FILE", str(ledger))
+    monkeypatch.setattr(p.completion_log, "reset_for_tests", lambda: None)
+
+    calls: list[str] = []
+    _patch_fetch(monkeypatch, {"items": [_item()]}, calls)
+    monkeypatch.setattr(p, "_online_meta_for_request",
+                        lambda *a: {"title": "晴天", "artist": "周杰伦", "duration_s": 269.0})
+
+    async def fake_open(request, guid, range_header, **kwargs):
+        return None if guid == NETEASE_GUID else _opened()
+
+    monkeypatch.setattr(p, "_open_online_stream", fake_open)
+    response = await p.stream_track(_request())
+    assert response.status_code == 307
+    await asyncio.sleep(0.05)  # 等后台落盘任务完成
+
+    import json as _json
+    from proxy import completion_log as cl
+    s = cl.summary(read_only=True)
+    assert s["counts"]["hit"] >= 1
+    rec = s["latest"]
+    assert rec["event"] == "completion_hit" and rec["outcome"] == "hit"
+    assert rec["provider"] == "netease" and rec["guid"] == NETEASE_GUID
+    assert rec["fallback_guid"].startswith("online:kuwo:")
+    assert rec["title"] == "晴天" and rec["artist"] == "周杰伦"     # 歌名/歌手入账
+    assert isinstance(rec.get("elapsed_ms"), int)                  # 耗时入账
+
+    # 关闭开关再播一次 → 应有 switch_off 的 skip 记录，且未发起搜索
+    monkeypatch.setitem(CONF, "fallback_enabled", False)
+    calls.clear()
+    response = await p.stream_track(_request())
+    assert response.status_code == 404 and calls == []
+    await asyncio.sleep(0.05)
+    s = cl.summary(read_only=True)
+    assert s["counts"]["skip"] >= 1
+    assert any(r["reason"] == "switch_off" for r in s["records"])
+
+
+@pytest.mark.anyio
 async def test_stream_fallback_metadata_from_neteasefree_client(monkeypatch):
     """3.3 neteasefree 为活跃客户端时 info 解析同样可用。"""
     p = importlib.import_module("proxy.app")
@@ -792,3 +864,28 @@ async def test_stream_fallback_metadata_from_neteasefree_client(monkeypatch):
 
     assert response.status_code == 307
     assert calls == ["晴天 周杰伦"]
+
+
+# =========================================================================
+# 音源适配器注册表（change add-full-track-completion · 任务 1.1）
+# =========================================================================
+def test_completion_adapter_registry_resolves_netease():
+    """网易注册为第一个音源适配器；未注册的音源不参与补全。"""
+    p = importlib.import_module("proxy.app")
+    adapter = p._completion_adapter_for(NETEASE_GUID)
+    assert adapter is not None
+    assert adapter.source == "netease"
+    assert p._completion_adapter_for("online:kuwo:1") is None
+    assert p._completion_adapter_for("online:bogus:1") is None
+
+
+def test_completion_adapter_unavailability_reason_pin_dropped(monkeypatch):
+    """pin 弃钉（pin[1]==0）时适配器给出 pin_dropped 原因。"""
+    p = importlib.import_module("proxy.app")
+    adapter = p._completion_adapter_for(NETEASE_GUID)
+    assert adapter.unavailability_reason(NETEASE_GUID) is None
+    p._NETEASE_URL_PIN["123"] = ("http://x", 0.0)
+    try:
+        assert adapter.unavailability_reason(NETEASE_GUID) == "pin_dropped"
+    finally:
+        p._NETEASE_URL_PIN.pop("123", None)

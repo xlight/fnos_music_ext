@@ -59,6 +59,30 @@ def test_settings_has_desktop_mobile_navigation_and_three_local_preferences():
             "cleanup-modal", "cleanup-confirm-btn", "cleanup-status", "cleanup-details"} <= ids
 
 
+def test_completion_is_a_left_nav_section_with_controls_help_and_overview_card():
+    """补全是左侧菜单的独立 section（page-completion + 导航按钮），含开关/四个数字控件/帮助/记录表/概览卡。"""
+    tags = elements()
+    sections = {a["id"] for tag, a in tags if tag == "section" and "id" in a}
+    nav_pages = [a.get("data-page") for tag, a in tags if tag == "button" and a.get("data-page")]
+    assert "page-completion" in sections
+    assert nav_pages.count("completion") == 2          # 桌面侧栏 + 移动端底栏
+    assert nav_pages.index("completion") == nav_pages.index("source") + 1
+    ids = {a["id"]: a for tag, a in tags if tag == "input" and "id" in a}
+    assert ids["completion-enabled"]["type"] == "checkbox"
+    assert ids["completion-timeout"]["type"] == "number"
+    assert (ids["completion-timeout"]["min"], ids["completion-timeout"]["max"]) == ("1", "60")
+    assert (ids["completion-limit"]["min"], ids["completion-limit"]["max"]) == ("1", "30")
+    assert (ids["completion-grace"]["min"], ids["completion-grace"]["max"]) == ("0", "15")  # 0 合法
+    assert (ids["completion-total-max"]["min"], ids["completion-total-max"]["max"]) == ("5", "300")
+    all_ids = {a["id"] for tag, a in tags if "id" in a}
+    assert {"completion-table", "completion-refresh", "completion-prev", "completion-next",
+            "completion-tbody", "completion-note", "completion-page"} <= all_ids
+    assert {"ov-completion-card", "ov-completion", "ov-completion-open"} <= all_ids
+    assert 'data-help-id="completion"' in HTML
+    assert "[VIP]" in HTML
+    assert "搜索超时默认 30 秒" in HTML and "搜索超时默认 15 秒" not in HTML
+
+
 def test_theme_tokens_cover_surfaces_and_keep_code_images_white():
     light = blocks(":root")[0]
     dark = blocks(':root[data-theme="dark"]')[0]

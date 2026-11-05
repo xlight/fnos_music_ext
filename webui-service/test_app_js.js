@@ -3119,3 +3119,167 @@ test("checkActiveConfigJob：页面初始化恢复未完成任务", async () => 
   console.log(`${tests.length - failed}/${tests.length} passed, ${failed} failed`);
   process.exitCode = failed ? 1 : 0;
 })();
+
+/* ================= 整曲补全（change add-full-track-completion · 任务 3.3-3.6/3.8） ================= */
+test("整曲补全：回显五个键，0 值保留、默认值来自 schema，旧后端禁用控件", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: { FNMUSIC_FALLBACK_GRACE_S: "0", FNMUSIC_FALLBACK_ENABLED: "true" },
+    schema: {
+      FNMUSIC_FALLBACK_ENABLED: { kind: "bool", default: "false" },
+      FNMUSIC_FALLBACK_TIMEOUT: { kind: "float", default: "18" },
+      FNMUSIC_FALLBACK_LIMIT: { kind: "int", default: "5" },
+      FNMUSIC_FALLBACK_GRACE_S: { kind: "float", default: "8" },
+      FNMUSIC_STREAM_TOTAL_MAX_S: { kind: "float", default: "20" },
+    },
+  });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#completion-enabled").checked, true);
+  assert.strictEqual(els.get("#completion-grace").value, "0");          // 0 不被默认值吞掉
+  assert.strictEqual(els.get("#completion-timeout").value, "18");      // 缺省用 schema 默认
+  assert.strictEqual(els.get("#completion-limit").value, "5");
+  assert.strictEqual(els.get("#completion-total-max").value, "20");
+  assert.strictEqual(els.get("#completion-grace").disabled, false);
+
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#completion-enabled").disabled, true);   // 旧后端禁用
+  assert.strictEqual(els.get("#completion-timeout").disabled, true);
+  const values = global.collectConfig();
+  for (const key of ["FNMUSIC_FALLBACK_ENABLED", "FNMUSIC_FALLBACK_TIMEOUT", "FNMUSIC_FALLBACK_LIMIT",
+                     "FNMUSIC_FALLBACK_GRACE_S", "FNMUSIC_STREAM_TOTAL_MAX_S"]) {
+    assert.ok(!(key in values), key);
+  }
+});
+
+test("整曲补全：收集时范围校验报中文错，0 合法，空值回落默认", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: {},
+    schema: {
+      FNMUSIC_FALLBACK_ENABLED: { kind: "bool", default: "false" },
+      FNMUSIC_FALLBACK_TIMEOUT: { kind: "float", default: "18" },
+      FNMUSIC_FALLBACK_LIMIT: { kind: "int", default: "5" },
+      FNMUSIC_FALLBACK_GRACE_S: { kind: "float", default: "8" },
+      FNMUSIC_STREAM_TOTAL_MAX_S: { kind: "float", default: "20" },
+    },
+  });
+  await global.loadConfig();
+  els.get("#completion-grace").value = "0";
+  els.get("#completion-limit").value = "30";
+  let values = global.collectConfig();
+  assert.strictEqual(values.FNMUSIC_FALLBACK_GRACE_S, 0);
+  assert.strictEqual(values.FNMUSIC_FALLBACK_LIMIT, 30);
+
+  els.get("#completion-grace").value = "16";
+  assert.throws(() => global.collectConfig(), /慢源宽限必须是 0–15/);
+  els.get("#completion-grace").value = "";
+  values = global.collectConfig();
+  assert.strictEqual(values.FNMUSIC_FALLBACK_GRACE_S, 8);
+  els.get("#completion-limit").value = "2.5";
+  assert.throws(() => global.collectConfig(), /每源候选条数必须是 1–30 的整数/);
+
+  els.get("#completion-timeout").value = "25";
+  els.get("#completion-timeout").dispatch("input");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+});
+
+test("整曲补全：记录列表渲染（歌名/命中音源/耗时，XSS 转义）+ 空态 + 不可用态", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/completion", {
+    ok: true,
+    completion: {
+      status: "ok", total: 2, counts: { hit: 1, miss: 0, skip: 1 }, latest: null,
+      records: [
+        { time: "2026-11-05T08:12:33+08:00", event: "completion_hit", outcome: "hit",
+          title: "歌<img src=x onerror=alert(1)>", artist: "歌手A", provider: "netease", source_guid: "online:netease:1",
+          reason: "preview_rejected", elapsed_ms: 4321, fallback_source: "kuwo", fallback_guid: "online:kuwo:1" },
+        { time: "2026-11-05T08:11:00+08:00", event: "completion_skip", outcome: "skip",
+          title: "歌2", provider: "netease", source_guid: "online:netease:2", reason: "switch_off" },
+      ],
+    },
+  });
+  await global.refreshCompletion();
+  const html = els.get("#completion-tbody").innerHTML;
+  assert.ok(html.includes("已补全 → kuwo"), "命中音源要显示");
+  assert.ok(html.includes("歌手A"), "歌手要显示在曲目列");
+  assert.ok(html.includes("4321 ms"), "耗时要显示");
+  assert.ok(html.includes("跳过（switch_off）"), "跳过+原因");
+  assert.ok(!html.includes("<img src=x"), "曲名里的 HTML 必须被转义");
+  assert.ok(html.includes("&lt;img src=x"), "转义后的形态");
+  assert.strictEqual(els.get("#completion-table").hidden, false);
+
+  reset();
+  enqueue("/app/fnmusic-ext/api/completion", {
+    ok: true, completion: { status: "ok", total: 0, counts: { hit: 0, miss: 0, skip: 0 }, latest: null, records: [] },
+  });
+  await global.refreshCompletion();
+  assert.strictEqual(els.get("#completion-table").hidden, true);
+  assert.ok(els.get("#completion-note").textContent.includes("暂无补全记录"));
+
+  reset();
+  enqueue("/app/fnmusic-ext/api/completion", { ok: false, status: "corrupt", error: "账本文件损坏" });
+  await global.refreshCompletion();
+  assert.ok(els.get("#completion-note").textContent.includes("暂不可用"));
+  assert.strictEqual(els.get("#completion-table").hidden, true);
+});
+
+test("整曲补全：概览卡片渲染（计数+最近一次完整信息，转义）与显示条件", async () => {
+  reset();
+  global.renderOverviewCompletion({
+    version: "t", current_provider: "musicdl", processes: {}, services: {}, lx_source: null,
+    completion: {
+      counts: { hit: 3, miss: 1, skip: 2 }, total: 6,
+      latest: { time: "2026-11-05T09:00:00+08:00", outcome: "hit", title: "歌<b>", artist: "歌手B", provider: "netease",
+                reason: "preview_rejected", elapsed_ms: 1720, fallback_source: "kuwo", fallback_guid: "online:kuwo:9" },
+    },
+  });
+  assert.strictEqual(els.get("#ov-completion-card").hidden, false);
+  const html = els.get("#ov-completion").innerHTML;
+  assert.ok(html.includes("命中 3") && html.includes("跳过 2"));
+  assert.ok(html.includes("近 200 次内"));
+  assert.ok(html.includes("→ kuwo"), "概览卡也要显示命中音源");
+  assert.ok(html.includes("1720 ms"), "概览卡显示耗时");
+  assert.ok(html.includes("歌手B"), "概览卡显示歌手");
+  assert.ok(!html.includes("歌<b>"), "曲名必须转义");
+  global.renderOverviewCompletion({ current_provider: "musicdl", completion: { counts: { hit: 0, miss: 0, skip: 0 }, total: 0, latest: null } });
+  assert.strictEqual(els.get("#ov-completion-card").hidden, true);
+  global.renderOverviewCompletion({ current_provider: "musicbox", completion: { counts: { hit: 0, miss: 0, skip: 0 }, total: 0, latest: null } });
+  assert.strictEqual(els.get("#ov-completion-card").hidden, false);
+});
+
+test("整曲补全：保存成功提示热重载延迟，预算高于总上限时告警夹紧", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {
+    FNMUSIC_FALLBACK_ENABLED: { kind: "bool", default: "false" },
+    FNMUSIC_FALLBACK_TIMEOUT: { kind: "float", default: "25" },
+    FNMUSIC_FALLBACK_LIMIT: { kind: "int", default: "5" },
+    FNMUSIC_FALLBACK_GRACE_S: { kind: "float", default: "8" },
+    FNMUSIC_STREAM_TOTAL_MAX_S: { kind: "float", default: "30" },
+  } });
+  await global.loadConfig();
+  enqueue("/app/fnmusic-ext/api/config", { ok: true, changed: ["FNMUSIC_FALLBACK_TIMEOUT"], actions: [], restart_keys: [], warnings: [], ignored_keys: [] });
+  els.get("#completion-timeout").value = "20";
+  els.get("#completion-timeout").dispatch("input");
+  await global.saveConfig();
+  const toast1 = els.get("#toast").textContent;
+  assert.ok(toast1.includes("热重载生效"), "保存提示应说明热重载延迟: " + toast1);
+  assert.ok(!toast1.includes("夹紧"), "预算未超上限不应告警");
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {
+    FNMUSIC_FALLBACK_ENABLED: { kind: "bool", default: "false" },
+    FNMUSIC_FALLBACK_TIMEOUT: { kind: "float", default: "25" },
+    FNMUSIC_FALLBACK_LIMIT: { kind: "int", default: "5" },
+    FNMUSIC_FALLBACK_GRACE_S: { kind: "float", default: "8" },
+    FNMUSIC_STREAM_TOTAL_MAX_S: { kind: "float", default: "30" },
+  } });
+  await global.loadConfig();
+  enqueue("/app/fnmusic-ext/api/config", { ok: true, changed: ["FNMUSIC_FALLBACK_TIMEOUT"], actions: [], restart_keys: [], warnings: [], ignored_keys: [] });
+  els.get("#completion-timeout").value = "40";
+  els.get("#completion-timeout").dispatch("input");
+  await global.saveConfig();
+  const toast2 = els.get("#toast").textContent;
+  assert.ok(toast2.includes("热重载生效"), toast2);
+  assert.ok(toast2.includes("高于首播总时长上限 30s"), "应告警被总上限 30 夹紧: " + toast2);
+});

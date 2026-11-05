@@ -158,8 +158,113 @@ $("#llm-usage-refresh")?.addEventListener("click", () => refreshLlmUsage());
 $("#llm-usage-prev")?.addEventListener("click", () => { llmUsageOffset = Math.max(0, llmUsageOffset - LLM_USAGE_PAGE_SIZE); void refreshLlmUsage(); });
 $("#llm-usage-next")?.addEventListener("click", () => { if (llmUsageOffset + LLM_USAGE_PAGE_SIZE < Number(llmUsageLast?.totalDays || 0)) { llmUsageOffset += LLM_USAGE_PAGE_SIZE; void refreshLlmUsage(); } });
 
-function likedNumber(selector, label, min, max, integer = false) {
-  const text = $(selector).value.trim();
+/* -------------------------------------------------------------- 整曲补全记录 */
+const COMPLETION_PAGE_SIZE = 20;
+let completionOffset = 0;
+let completionLast = null;
+
+const COMPLETION_OUTCOME_LABEL = { hit: "已补全", miss: "未命中", skip: "跳过" };
+
+function completionTime(iso) {
+  // 账本 time 是 ISO8601 带 +08:00 偏移；直接展示，不依赖浏览器时区
+  const s = String(iso || "");
+  return s.length >= 16 ? `${s.slice(0, 10)} ${s.slice(11, 16)}` : s;
+}
+
+async function refreshCompletion() {
+  const note = $("#completion-note");
+  if (!note) return;
+  try {
+    const body = await api(`/api/completion?limit=${COMPLETION_PAGE_SIZE}&offset=${completionOffset}`);
+    if (!body || !body.ok) throw new Error(body && body.error ? body.error : "记录不可用");
+    completionLast = body.completion;
+    renderCompletion(body.completion);
+  } catch (exc) {
+    note.textContent = `补全记录暂不可用：${(exc && exc.message) || exc}（不是"没有记录"）`;
+    $("#completion-table").hidden = true;
+  }
+}
+
+function renderCompletion(data) {
+  const note = $("#completion-note");
+  const table = $("#completion-table");
+  const tbody = $("#completion-tbody");
+  const records = (data && data.records) || [];
+  if (!note || !table || !tbody) return;
+  if (!records.length) {
+    note.textContent = "暂无补全记录。";
+    table.hidden = true;
+    $("#completion-page").textContent = "1";
+    return;
+  }
+  note.textContent = `共 ${data.total != null ? data.total : records.length} 条记录。`;
+  // 曲名/歌手/音源名是外部数据，渲染必须 escapeHtml，防存储型 XSS
+  tbody.innerHTML = records.map((r) => {
+    const title = escapeHtml([r.title, r.artist].filter(Boolean).join(" · ") || r.source_guid || "");
+    const outcome = COMPLETION_OUTCOME_LABEL[r.outcome] || escapeHtml(String(r.outcome || ""));
+    const reason = r.reason ? `（${escapeHtml(String(r.reason))}）` : "";
+    // 命中时展示换到的音源（fallback_source / fallback_guid）
+    const hit = r.fallback_guid
+      ? ` → ${escapeHtml(String(r.fallback_source || String(r.fallback_guid).split(":")[1] || r.fallback_guid))}`
+      : "";
+    const ms = r.elapsed_ms != null ? `${r.elapsed_ms} ms` : "";
+    const src = escapeHtml(String(r.provider || String(r.source_guid || "").split(":")[1] || ""));
+    return `<tr><td>${escapeHtml(completionTime(r.time))}</td><td>${title}</td><td>${src}</td>` +
+      `<td>${outcome}${hit}${reason}</td><td>${escapeHtml(ms)}</td></tr>`;
+  }).join("");
+  table.hidden = false;
+  $("#completion-page").textContent = String(Math.floor(completionOffset / COMPLETION_PAGE_SIZE) + 1);
+}
+
+$("#completion-refresh")?.addEventListener("click", () => { void refreshCompletion(); });
+$("#completion-prev")?.addEventListener("click", () => { completionOffset = Math.max(0, completionOffset - COMPLETION_PAGE_SIZE); void refreshCompletion(); });
+$("#completion-next")?.addEventListener("click", () => {
+  if (completionLast && completionOffset + COMPLETION_PAGE_SIZE < (completionLast.total || 0)) {
+    completionOffset += COMPLETION_PAGE_SIZE; void refreshCompletion();
+  }
+});
+$("#ov-completion-open")?.addEventListener("click", () => switchPage("completion"));
+
+function renderOverviewCompletion(st) {
+  const card = $("#ov-completion-card");
+  if (!card) return;
+  const c = st && st.completion;
+  const accountProvider = ["musicbox", "neteasefree"].includes(st && st.current_provider);
+  const hasRecords = !!(c && (c.latest || (c.total > 0)));
+  if (!hasRecords && !accountProvider) { card.hidden = true; return; }
+  card.hidden = false;
+  const counts = (c && c.counts) || {};
+  const latest = c && c.latest;
+  const rows = [
+    `<div class="kv"><b>近 200 次内</b>命中 ${counts.hit || 0} · 未命中 ${counts.miss || 0} · 跳过 ${counts.skip || 0}</div>`,
+  ];
+  if (latest) {
+    const outcome = COMPLETION_OUTCOME_LABEL[latest.outcome] || String(latest.outcome || "");
+    const reason = latest.reason ? `（${escapeHtml(String(latest.reason))}）` : "";
+    const hitSrc = latest.fallback_guid
+      ? ` → ${escapeHtml(String(latest.fallback_source || String(latest.fallback_guid).split(":")[1] || ""))}`
+      : "";
+    const ms = latest.elapsed_ms != null ? ` · ${escapeHtml(String(latest.elapsed_ms))} ms` : "";
+    rows.push(`<div class="kv"><b>最近一次</b>${escapeHtml([latest.title, latest.artist].filter(Boolean).join(" · ") || latest.source_guid || "")} · ${escapeHtml(outcome)}${hitSrc}${reason}${ms} · ${escapeHtml(completionTime(latest.time))}</div>`);
+  } else {
+    rows.push('<div class="kv"><b>最近一次</b>暂无</div>');
+  }
+  $("#ov-completion").innerHTML = rows.join("");
+}
+
+
+/* 整曲补全数值控件：空串=用默认值；0 是合法值（如慢源宽限），绝不能用 || 兜底吞掉。*/
+function completionNumber(selector, label, min, max, integer, fallback) {
+  const text = ($(selector) || {}).value;
+  if (text === undefined || text === null || String(text).trim() === "") return fallback;
+  const num = Number(text);
+  if (!Number.isFinite(num) || num < min || num > max || (integer && !Number.isInteger(num))) {
+    throw new Error(`${label}必须是 ${min}–${max} 的${integer ? "整数" : "数字"}`);
+  }
+  return integer ? Math.trunc(num) : num;
+}
+
+function likedNumber(selector, label, min, max, integer = false) {  const text = $(selector).value.trim();
   const num = Number(text);
   if (!text || !Number.isFinite(num) || num < min || (max != null && num > max) || (integer && !Number.isInteger(num))) {
     throw new Error(label + (integer ? "必须是 0–100 的整数" : "必须是大于或等于 0.5 的有限数字"));
@@ -346,6 +451,9 @@ function switchPage(page) {
 
   if (typeof setLlmUsageActive === "function") {
     setLlmUsageActive(page === "llm");
+  }
+  if (page === "completion" && typeof refreshCompletion === "function") {
+    void refreshCompletion();   // 打开「补全」菜单页时加载补全记录
   }
 
   if (page === "about") loadAbout().catch((exc) => { $("#about-logs").textContent = "加载失败：" + exc.message; });
@@ -537,6 +645,7 @@ async function loadStatus() {
     syncLxSourceOrder();
     renderLxSourceList(); // 只同步运行徽标，不重载配置或丢弃尚未保存的编辑。
     renderLxSourceOrder();
+    renderOverviewCompletion(st);   // 概览页「最近补全」卡片（数据来自 /api/status 的 completion 摘要）
     const lxCard = $("#ov-lx-card");
     if (st.current_provider === "lxmusic" && st.lx_source) {
       lxCard.hidden = false;
@@ -625,6 +734,25 @@ function applyConfigToForm() {
     el.disabled = !configSchema[key];
     el.checked = configSchema[key] ? ["true", "1", "yes", "on"].includes(String(v[key] || "").trim().toLowerCase()) : false;
   });
+  // 整曲补全五个键：旧后端（schema 缺键）时禁用控件，避免"改了以为生效实际没有"
+  [
+    ["#completion-enabled", "FNMUSIC_FALLBACK_ENABLED"],
+    ["#completion-timeout", "FNMUSIC_FALLBACK_TIMEOUT"],
+    ["#completion-limit", "FNMUSIC_FALLBACK_LIMIT"],
+    ["#completion-grace", "FNMUSIC_FALLBACK_GRACE_S"],
+    ["#completion-total-max", "FNMUSIC_STREAM_TOTAL_MAX_S"],
+  ].forEach(([selector, key]) => {
+    const el = $(selector);
+    if (!el) return;
+    el.disabled = !configSchema[key];
+  });
+  const completionDefault = (key, fallback) => (configSchema[key] && configSchema[key].default) || fallback;
+  $("#completion-enabled").checked = ["true", "1", "yes", "on"].includes(String(v.FNMUSIC_FALLBACK_ENABLED || completionDefault("FNMUSIC_FALLBACK_ENABLED", "false")).trim().toLowerCase());
+  $("#completion-timeout").value = v.FNMUSIC_FALLBACK_TIMEOUT ?? completionDefault("FNMUSIC_FALLBACK_TIMEOUT", "18");
+  $("#completion-limit").value = v.FNMUSIC_FALLBACK_LIMIT ?? completionDefault("FNMUSIC_FALLBACK_LIMIT", "5");
+  // 注意：不能写成 parseFloat(v) || 默认 —— 空串与 0 都会被 || 吞掉（GRACE_S=0 是合法值）
+  $("#completion-grace").value = v.FNMUSIC_FALLBACK_GRACE_S ?? completionDefault("FNMUSIC_FALLBACK_GRACE_S", "8");
+  $("#completion-total-max").value = v.FNMUSIC_STREAM_TOTAL_MAX_S ?? completionDefault("FNMUSIC_STREAM_TOTAL_MAX_S", "20");
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
   $("#public-playlists-enabled").checked = v.FNMUSIC_PUBLIC_PLAYLISTS_ENABLED === "true";
@@ -767,6 +895,13 @@ function collectConfig() {
     FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
     FNMUSIC_SEARCH_DEEP_PAGE: $("#search-deep").checked,
     FNMUSIC_SEARCH_DEEP_MAX_PAGES: parseInt($("#search-deep-max").value || "10", 10) || 10,
+    // 整曲补全五个键：schema 守卫（旧后端缺键则不提交）；数值走"判空串→Number→范围校验"，
+    // 不用 || 兜底（会吞掉合法的 0，如 GRACE_S=0）；空值按"用默认"处理，不当 0/false 提交。
+    ...(configSchema.FNMUSIC_FALLBACK_ENABLED ? { FNMUSIC_FALLBACK_ENABLED: $("#completion-enabled").checked } : {}),
+    ...(configSchema.FNMUSIC_FALLBACK_TIMEOUT ? { FNMUSIC_FALLBACK_TIMEOUT: completionNumber("#completion-timeout", "补全搜索预算", 1, 60, false, 18) } : {}),
+    ...(configSchema.FNMUSIC_FALLBACK_LIMIT ? { FNMUSIC_FALLBACK_LIMIT: completionNumber("#completion-limit", "每源候选条数", 1, 30, true, 5) } : {}),
+    ...(configSchema.FNMUSIC_FALLBACK_GRACE_S ? { FNMUSIC_FALLBACK_GRACE_S: completionNumber("#completion-grace", "慢源宽限", 0, 15, false, 8) } : {}),
+    ...(configSchema.FNMUSIC_STREAM_TOTAL_MAX_S ? { FNMUSIC_STREAM_TOTAL_MAX_S: completionNumber("#completion-total-max", "首播总时长上限", 5, 300, false, 20) } : {}),
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
     FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-playlist-resident").checked,
     LX_SOURCE_LIST: JSON.stringify(lxSourceList),
@@ -895,6 +1030,14 @@ async function checkActiveConfigJob() {
   } catch (_) {
     // 忽略检查活动任务的非阻断异常
   }
+/* 补全预算若高于首播总上限，会被代理夹紧——保存时给出提示，避免"调大了没生效" */
+function completionBudgetNote(values) {
+  const budget = Number(values && values.FNMUSIC_FALLBACK_TIMEOUT);
+  const cap = Number(values && values.FNMUSIC_STREAM_TOTAL_MAX_S);
+  if (Number.isFinite(budget) && Number.isFinite(cap) && budget > cap) {
+    return `注意：补全搜索预算 ${budget}s 高于首播总时长上限 ${cap}s，实际生效为上限内的剩余额`;
+  }
+  return "";
 }
 
 async function saveConfig() {
@@ -1021,7 +1164,8 @@ async function saveConfig() {
     if (failed.length) {
       toast((parts.join("；") || "") + ` —— ${failed.map((f) => f.error).join("；")}`, "fail");
     } else {
-      toast(parts.join("；") || "配置无变化", "ok");
+      const note = completionBudgetNote(values);
+      toast((parts.join("；") || "已保存") + "（代理约 3 秒内热重载生效）" + (note ? `；${note}` : ""), "ok");
     }
     clearDirty();
     try { await loadConfig(); } catch (err) { console.warn("配置加载失败", err); }
@@ -2816,8 +2960,10 @@ DIR_FIELDS.forEach(bindDirField);
 })();
 
 /* -------------------------------------------------------------- 表单脏标记 */
-["#tee-max", "#llm-base", "#llm-key", "#llm-model", "#liked-refresh-hours", "#liked-size", "#search-timeout", "#search-deep-max", "#bind-timeout", "#handoff-max", "#scan-path", "#lx-resolver-timeout", "#lx-url-timeout", "#lx-probe-timeout"].forEach((sel) =>
+["#tee-max", "#llm-base", "#llm-key", "#llm-model", "#liked-refresh-hours", "#liked-size", "#search-timeout", "#search-deep-max", "#completion-timeout", "#completion-limit", "#completion-grace", "#completion-total-max", "#bind-timeout", "#handoff-max", "#scan-path", "#lx-resolver-timeout", "#lx-url-timeout", "#lx-probe-timeout"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
+["#completion-enabled"].forEach((sel) =>
+  $(sel).addEventListener("change", () => markDirty()));
 ["#llm-liked", "#llm-daily"].forEach((sel) => $(sel).addEventListener("change", () => {
   updateLlmLikedSettings();
   markDirty();
