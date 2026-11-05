@@ -5,7 +5,7 @@
 
 ## [Unreleased]
 
-- 榜单歌单注入修复：内置 38 榜（酷狗 20 + 网易云 18）此前只有数据层（抓取/缓存/预热），未接入歌单接口——现已注入 `playlist/list` 卡片，并新增 `playlist/detail`、`batch-detail`、`track/playlist-detail/list` 的榜单分支，曲目走当日榜单缓存（`FNMUSIC_CHART_LIMIT` 上限）；受 `FNMUSIC_RECOMMEND_CHARTS` / `FNMUSIC_KG_CHARTS` / `FNMUSIC_WY_CHARTS` / `FNMUSIC_ENABLED_CHARTS` 白名单门控，白名单外的榜单 guid 返回 not found。
+- 榜单歌单注入修复：内置 38 榜（酷狗 20 + 网易云 18）此前只有数据层（抓取/缓存/预热），未接入歌单接口——现已注入 `playlist/list` 卡片，并新增 `playlist/detail`、`batch-detail`、`track/playlist-detail/list` 的榜单分支，曲目走当日榜单缓存（`FNMUSIC_CHART_LIMIT` 上限）；受 `FNMUSIC_RECOMMEND_CHARTS` / `FNMUSIC_KG_CHARTS` / `FNMUSIC_WY_CHARTS` / `FNMUSIC_ENABLED_CHARTS` 白名单门控，白名单外的榜单 guid 返回 not found。榜单曲目出列表前统一经 `build_online_track` 转成飞牛 VO（此前直接下发音源原始行会让客户端 renderRow 读到 null 崩溃）。
 - 热门推荐兜底：热门链新增 `builtin-charts` 第三 tier——音源（musicbox / lxmusic）不可用时，热门推荐改由内置榜单当日缓存填充，musicdl-only 部署也能看到热门榜单推荐。
 - 整曲补全配置面：管理台「音乐源」页新增「整曲补全」区块——总开关 `FNMUSIC_FALLBACK_ENABLED`（**默认关闭**：换源会改变实际听到的版本，由用户主动开启）加上已有的四个旋钮（补全搜索预算 / 每源候选条数 / 慢源宽限 / 首播总时长上限），保存热重载即生效；概览页新增「最近补全」摘要卡。**注意**：2.12.0h 里网易回退是无条件开启的，本版开关默认关——升级后如需回退请在管理台打开。
 - 补全诊断：代理把每次补全尝试（命中 / 未命中 / 跳过及原因，含触发原因如试听被拒、VIP 无权益）写入有界账本 `completion_log.json`，管理台「补全记录」列表 + 概览摘要可查看；账本损坏自动隔离（`.corrupt-*`）且不中断记录。
