@@ -61,11 +61,48 @@ def check_is_logged_in() -> bool:
     return ok
 
 
-def filter_playable_song_ids(ids: "list[int]") -> set[int]:
+# 试听交叉校验阈值（change D7b）：上游 size（= Content-Length）×8/dt 低于真实
+# MP3 下限（~64 kbps）判试听。仅在 freeTrialInfo 缺失时启用——字段判定优先。
+_NETEASE_TRIAL_MIN_BPS = 64_000.0
+
+
+def cross_check_trial_bitrate(size_bytes: Any, duration_ms: Any, br: Any = None) -> bool:
+    """网易试听交叉校验：True = 判试听（丢弃），False = 放行给字段结论。
+
+    - size（上游行里的 Content-Length）或 dt 缺失 → 不判定（放行）。
+    - CL×8/dt < 64 kbps → 判试听；服务端自报 br 时再用「文件自身时长明显短于
+      元数据时长」复核（size×8/br ≪ dt），避免元数据时长异常时误杀。
+    - 全长直链：CL×8/dt == br（如 320000）→ 放行。
+    """
+    try:
+        size = float(size_bytes or 0)
+        dur_ms = float(duration_ms or 0)
+    except (TypeError, ValueError):
+        return False
+    if size <= 0 or dur_ms <= 0:
+        return False
+    dur_s = dur_ms / 1000.0
+    if dur_s <= 0:
+        return False
+    if size * 8.0 / dur_s >= _NETEASE_TRIAL_MIN_BPS:
+        return False
+    try:
+        br_bps = float(br or 0)
+    except (TypeError, ValueError):
+        br_bps = 0.0
+    if br_bps > 0:
+        implied_s = size * 8.0 / br_bps
+        return bool(implied_s < dur_s * 0.9)
+    return True
+
+
+def filter_playable_song_ids(ids: "list[int]",
+                             durations_ms: "dict[int, float] | None" = None) -> set[int]:
     """批量取链判定可播：最低档能拿到非空直链即视为可播。
 
     与旧实现一致，区分「带 freeTrialInfo 的试听片段」并剔除；不同之处在于
     后端自带 VIP，收费曲目同样能出直链，因此不再按 fee 过滤。
+    durations_ms 给了元数据时长时追加试听交叉校验（仅 freeTrialInfo 缺失时启用）。
     传输异常时放行全部（fail-open）：真正的可播性在播放时仍会再解析一次，
     宁可多展示一条也不要让搜索因一次网络抖动而空掉。
     """
@@ -86,8 +123,16 @@ def filter_playable_song_ids(ids: "list[int]") -> set[int]:
         if item.get("freeTrialInfo"):
             continue
         sid = api._int(item.get("id"))
-        if sid > 0:
-            playable.add(sid)
+        if sid <= 0:
+            continue
+        # 试听交叉校验（仅 freeTrialInfo 缺失时启用）：字段结论已定，这里只做
+        # 补充收紧——上游说可播，但 CL×8/dt 低于真实码率下限 → 实际是试听片段。
+        if durations_ms:
+            duration_ms = durations_ms.get(sid)
+            if duration_ms and cross_check_trial_bitrate(
+                    item.get("size"), duration_ms, item.get("br")):
+                continue
+        playable.add(sid)
     return playable
 
 
@@ -102,7 +147,14 @@ def batch_song_details(ids: "list[int]") -> list[dict[str, Any]]:
         logger.warning("batch_song_details failed: %s", exc)
         return []
     priv_map = {api._int(p.get("id")): p for p in privileges}
-    playable = filter_playable_song_ids(wanted)
+    # 元数据时长（dt）交给可播过滤做试听交叉校验（见 change D7b）。
+    durations: dict[int, int] = {}
+    for song in songs:
+        sid = api._int(song.get("id") or song.get("song_id"))
+        dt = api._int(song.get("dt") or song.get("duration"))
+        if sid > 0 and dt > 0:
+            durations[sid] = dt
+    playable = filter_playable_song_ids(wanted, durations or None)
     detail_map: dict[int, dict] = {}
     for song in songs:
         row = api.song_detail_row(song, priv_map.get(api._int(song.get("id"))))
@@ -127,6 +179,10 @@ def get_song_url(song_id: int, quality: str) -> "dict[str, Any] | None":
         return None
     if item is None:
         return None
+    # 上游字段判试听（change D7）：freeTrialInfo 明示只给试听片段 → 不是可播全曲，
+    # 判成不可播（url=None）让调用方走回退。字段权威，不新增网络请求。
+    if item.get("code") == 200 and item.get("freeTrialInfo"):
+        item = {**item, "code": 404, "url": None, "trial_rejected": True}
     ok = item.get("code") == 200 and bool(item.get("url"))
     with _url_cache_lock:
         if len(_url_cache) >= _URL_CACHE_MAX:

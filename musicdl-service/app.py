@@ -218,6 +218,16 @@ def _source_client(name: str) -> str:
     return client
 
 
+def _item_source_client(item: dict) -> str:
+    """条目里的短源名（"apple"）→ SDK 客户端名（"AppleMusicClient"）。
+
+    缓存条目只带短源名；preview-only 排除按客户端名判定，故这里做一次映射。
+    未知源名原样返回（不影响排除判定）。
+    """
+    src = str((item or {}).get("source") or "").strip().casefold()
+    return SOURCE_NAMES.get(src, src)
+
+
 def _cache_put(item: dict, keyword: str, download_headers: dict, lyric: str):
     with _CACHE_LOCK:
         if len(_SONG_CACHE) >= CONF["cache_max"]:
@@ -292,25 +302,45 @@ async def _refresh_by_keyword(song_id: str) -> dict | None:
 _PROBE_EXTS = {"flac", "wav", "ape", "m4a", "alac", "ogg", "opus"}
 _PROBE_BYTES = 3 * 1024 * 1024
 _PROBE_MIN_DECODED_S = 1.0
-_PROBE_CACHE: dict[str, tuple[float, bool]] = {}
+_PROBE_CACHE: dict[str, tuple[float, bool, float | None, bool]] = {}
 _PROBE_CACHE_LOCK = threading.Lock()
 _PROBE_TTL = int(os.environ.get("MUSICDL_PROBE_TTL", "600"))
+# 预览守卫阈值（运行时实测时长，见 change D8）：整文件都被探针读到、且实际时长
+# 明显短于元数据时长（50%）判试听。
+_PREVIEW_RATIO = 0.5
+
+
+def _preview_only_sources() -> set[str]:
+    """只能交付试听的源：恒为 Apple。
+
+    musicdl 的 AppleMusicClient 只有两条取链路径：
+    - 无账号态（`_parsewithnonvipofficialapiv1`）：`attributes.previews[0].url`
+      → 官方 30-90s 试听片段；
+    - 有 media-user-token（`_parsewithvipofficialapiv1`）：返回受保护的
+      `DownloadItem`（HLS/加密），本服务只交付裸 HTTP 媒体直链，
+      `is_candidate_playable` 会直接判不可交付。
+
+    因此"配了 token 就能恢复全曲"在当前交付形态下**不成立**（既没有可转发的
+    直链，也没有本地解密 wrapper）。上游 musicdl 支持 Apple 全曲直链、或本项目
+    自建 Apple 分支之前，Apple 一律按 preview-only 排除——不设 env 逃生口，
+    免得解除排除后 90s 试听重新流入搜索与播放链路。
+    """
+    return {"AppleMusicClient"}
 
 
 def ffmpeg_bin() -> str | None:
     return os.environ.get("FNMUSIC_FFMPEG_BIN") or shutil.which("ffmpeg")
 
 
-def _decode_probe_ok(path: str) -> bool:
-    """ffmpeg 解码探针样本文件，以实际解出的时长判断好坏。
+def _decode_probe_seconds(path: str) -> float | None:
+    """ffmpeg 解码探针：返回实际解出秒数；无法解码/无 ffmpeg 时返回 None 放行。
 
-    截断的完好样本也能解出数十秒（探针只取头部字节）；从头就坏的样本
-    time≈0。报错文本不可用作判据——截断与损坏的报错完全相同。
-    若系统未配置/缺少 ffmpeg，无法执行解码校验，放行样本文件返回 True。
+    截断的完好样本也能解出数十秒（探针只取头部字节）；从头就坏的样本 time≈0。
+    报错文本不可用作判据——截断与损坏的报错完全相同。
     """
     bin_path = ffmpeg_bin()
     if not bin_path:
-        return True
+        return None
     try:
         r = subprocess.run(
             [bin_path, "-nostdin", "-hide_banner", "-i", path, "-f", "null", "-"],
@@ -318,14 +348,47 @@ def _decode_probe_ok(path: str) -> bool:
         )
         times = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr or "")
         if not times:
-            return False
+            return None
         h, mnt, s = times[-1]
-        return int(h) * 3600 + int(mnt) * 60 + float(s) >= _PROBE_MIN_DECODED_S
+        return int(h) * 3600 + int(mnt) * 60 + float(s)
     except Exception:
-        return False
+        return None
 
 
-def _head_probe_sync(url: str, headers: dict) -> bool:
+def _decode_probe_ok(path: str) -> bool:
+    """ffmpeg 解码探针样本文件，以实际解出的时长判断好坏。
+
+    若系统未配置/缺少 ffmpeg，无法执行解码校验，放行样本文件返回 True。
+    """
+    seconds = _decode_probe_seconds(path)
+    if seconds is None:
+        return True
+    return seconds >= _PROBE_MIN_DECODED_S
+
+
+def _probe_total_size(resp) -> int | None:
+    """探针响应的整文件大小（字节）：Content-Range 优先，其次 Content-Length。"""
+    try:
+        content_range = str(resp.headers.get("content-range") or "").strip()
+        if "/" in content_range:
+            tail = content_range.rsplit("/", 1)[1].strip()
+            if tail.isdigit():
+                return int(tail)
+        length = str(resp.headers.get("content-length") or "").strip()
+        if length.isdigit():
+            return int(length)
+    except Exception:
+        return None
+    return None
+
+
+def _head_probe_sync(url: str, headers: dict) -> tuple[bool, float | None, bool]:
+    """取头部字节并解码，返回 (ok, 解出秒数, 整文件已读完)。
+
+    「整文件已读完」= 探针窗口覆盖了完整文件（总大小 ≤ _PROBE_BYTES，或上游提前
+    结束）。只有这种情况下「解出秒数」才是文件真实时长；否则它只是前缀下界
+    （3MB FLAC 前缀 ≈ 25-40s），不能拿来跟元数据时长比长短。
+    """
     probe_headers = {k: v for k, v in headers.items() if k.lower() != "range"}
     probe_headers["Range"] = f"bytes=0-{_PROBE_BYTES - 1}"
     tmp_path = ""
@@ -339,7 +402,8 @@ def _head_probe_sync(url: str, headers: dict) -> bool:
             request = client.build_request("GET", url, headers=probe_headers)
             resp = client.send(request, stream=True)
         if resp.status_code not in (200, 206):
-            return False
+            return False, None, False
+        total = _probe_total_size(resp)
         iterator = resp.iter_content(256 * 1024) if HAS_CURL_CFFI else resp.iter_bytes(256 * 1024)
         buf = b""
         for chunk in iterator:
@@ -347,18 +411,23 @@ def _head_probe_sync(url: str, headers: dict) -> bool:
             if len(buf) >= _PROBE_BYTES:
                 break
         if not buf:
-            return False
+            return False, None, False
+        complete = bool((total is not None and total <= _PROBE_BYTES)
+                        or len(buf) < _PROBE_BYTES)
         if not ffmpeg_bin():
             # 仍执行不依赖 ffmpeg 的取流检查；缺少 ffmpeg 时无法执行解码校验，
             # 不判定音频损坏或因此强制降为 MP3，只要收到有效数据即放行
-            return True
+            return True, None, complete
         import tempfile
         with tempfile.NamedTemporaryFile(suffix=".probe", delete=False) as f:
             f.write(buf)
             tmp_path = f.name
-        return _decode_probe_ok(tmp_path)
+        seconds = _decode_probe_seconds(tmp_path)
+        if seconds is None:
+            return False, None, complete
+        return seconds >= _PROBE_MIN_DECODED_S, seconds, complete
     except Exception:
-        return False
+        return False, None, False
     finally:
         if resp is not None:
             with suppress(Exception):
@@ -371,17 +440,37 @@ def _head_probe_sync(url: str, headers: dict) -> bool:
                 os.unlink(tmp_path)
 
 
-async def _head_probe(url: str, headers: dict, song_id: str) -> bool:
+async def _head_probe(url: str, headers: dict, song_id: str) -> tuple[bool, float | None, bool]:
+    """返回 (ok, 解出秒数, 整文件已读完)。秒数仅供预览守卫使用；有效性判定仍只看 ok。"""
     with _PROBE_CACHE_LOCK:
         cached = _PROBE_CACHE.get(song_id)
     if cached and (time.time() - cached[0]) < _PROBE_TTL:
-        return cached[1]
-    ok = await asyncio.to_thread(_head_probe_sync, url, headers)
+        complete = cached[3] if len(cached) > 3 else False
+        return cached[1], (cached[2] if len(cached) > 2 else None), complete
+    ok, seconds, complete = await asyncio.to_thread(_head_probe_sync, url, headers)
     with _PROBE_CACHE_LOCK:
-        _PROBE_CACHE[song_id] = (time.time(), ok)
+        _PROBE_CACHE[song_id] = (time.time(), ok, seconds, complete)
     if not ok:
         logger.warning("stream head probe FAILED for %s (%s) — likely corrupt upstream bytes", song_id, url[:120])
-    return ok
+    return ok, seconds, complete
+
+
+def _preview_probe_reject(seconds: float | None, metadata_duration_s: float,
+                          complete: bool = False) -> bool:
+    """预览守卫：整文件都读到、且真实时长明显短于元数据时长（50%）→ 试听/截断流。
+
+    必须带「整文件已读完」：探针只取头部 3MB，前缀解码时长是下界，拿它跟元数据
+    比会把全长无损流（3MB FLAC ≈ 25-40s vs 元数据 269s）误判成试听而 404。
+    """
+    if seconds is None or not complete:
+        return False
+    try:
+        meta = float(metadata_duration_s or 0)
+    except (TypeError, ValueError):
+        return False
+    if meta <= 0:
+        return False
+    return bool(seconds < meta * _PREVIEW_RATIO)
 
 
 def _kuwo_force_mp3_url_sync(song_id: str) -> "tuple[str, dict] | None":
@@ -418,7 +507,8 @@ async def _maybe_downgrade(id: str, entry: dict, url: str, quality: str,
     want_mp3 = str(quality or "").strip().lower() == "mp3"
     if not want_mp3 and ext in _PROBE_EXTS:
         probe_headers = dict(entry.get("download_headers") or {})
-        if not await _head_probe(url, probe_headers, id):
+        probe_ok, _probe_seconds, _probe_complete = await _head_probe(url, probe_headers, id)
+        if not probe_ok:
             logger.warning("lossless stream corrupt for %s (ext=%s), downgrading to mp3", id, ext)
             want_mp3 = True
     if not want_mp3:
@@ -462,11 +552,12 @@ async def _resolve_entry(song_id: str, auto_refresh: bool = True):
     fresh = entry["item"].get("download_url") and (time.time() - entry["ts"]) < CONF["url_ttl"]
     if fresh:
         return entry
-    # URL 可能仍有效，探测一下
+    # URL 可能仍有效，探测一下（resolve 通路的有效性判定只看 ok，不用 seconds）
     if entry["item"].get("download_url"):
         head_headers = dict(entry.get("download_headers") or {})
-        valid = await asyncio.to_thread(_head_probe_sync, entry["item"]["download_url"], head_headers)
-        if valid:
+        probe_ok, _seconds, _complete = await asyncio.to_thread(
+            _head_probe_sync, entry["item"]["download_url"], head_headers)
+        if probe_ok:
             entry["ts"] = time.time()
             return entry
     if auto_refresh:
@@ -640,24 +731,47 @@ async def search(
     keyword: str = Query(..., min_length=1),
     limit: int = Query(None, ge=1, le=30),
     sources: str = Query("", description="逗号分隔的源名(短名或全名)，空=用默认白名单"),
+    grace_s: float = 0.0,
 ):
     if limit is None:
         limit = CONF["limit_per_source"]
-
+    # 宽限覆盖：回退搜索需要慢源也把结果交上来（默认 2s 宽限在 11 源配置下
+    # 只能等到第一个响应源，实测只拿到 1 条 120s 试听）。grace 参与缓存键，
+    # 否则短宽限的旧结果会被长宽限请求命中。
+    grace = CONF["slow_grace_s"] if grace_s <= 0 else min(15.0, float(grace_s))
     raw_src_list = CONF["sources"]
     if sources:
         raw_src_list = [_source_client(s) for s in sources.split(",") if s.strip()]
     raw_src_list = list(dict.fromkeys(raw_src_list))
     sources_key = ",".join(sorted(raw_src_list))
     cache_key = f"{sources_key}|limit={limit}"
+    if grace != CONF["slow_grace_s"]:
+        cache_key = f"{cache_key}|grace={grace:g}"
     _STATS["searches"] += 1
 
     async def _do_search() -> dict:
         # 1. 过滤熔断中的源
         active_src_list = [s for s in raw_src_list if not SOURCE_BREAKER.is_open(s)]
+        # 2. 源级排除 preview-only 源（Apple 只能交付 30-90s 试听片段）：
+        #    在源级（不启动 worker）跳过，不计熔断失败也不压自适应预算；
+        #    不做 URL 域名拦截——预览与全曲同族 audio-ssl.itunes.apple.com，
+        #    域名过滤会误杀未来真正支持全曲的 Apple 分支。
+        preview_only = _preview_only_sources()
+        excluded_preview = [s for s in raw_src_list if s in preview_only]
+        for s in excluded_preview:
+            _note_empty_source_result(s, SOURCE_BREAKER, ADAPTIVE)
+        if excluded_preview:
+            active_src_list = [s for s in active_src_list if s not in preview_only]
 
-        # 2. 查缓存（命中直接返回）
+        # 3. 查缓存（命中直接返回）
         cached = SEARCH_CACHE.get(keyword, cache_key)
+        if cached is not None and preview_only:
+            # 排除生效前缓存的 preview-only 条目也必须剔除，否则 Apple 仍会命中返回；
+            # 整条缓存都被剔除时视作未命中，让其余源重新搜一次。
+            filtered = [item for item in cached
+                        if _item_source_client(item) not in preview_only]
+            if len(filtered) != len(cached):
+                cached = filtered or None
         # Search results alone cannot serve playback after song-cache eviction.
         if cached is not None and all(_cache_get(item["id"]) for item in cached):
             return {
@@ -670,12 +784,19 @@ async def search(
 
         # 全被熔断且无缓存，直接返回空结果（不报错）
         if not active_src_list:
+            # 「被熔断」与「被 preview-only 排除」必须分开措辞：proxy 侧会把非空
+            # errors 判成硬失败（不缓存、对外报源失败），而 preview-only 排除按
+            # spec 不算源失败——用 "skipped " 前缀让 proxy 过滤掉。
+            errors: dict[str, str] = {}
+            for s in raw_src_list:
+                errors[s] = ("skipped preview-only source" if s in preview_only
+                             else "circuit breaker open")
             return {
                 "ok": True,
                 "cached": False,
                 "keyword": keyword,
                 "items": [],
-                "errors": {s: "circuit breaker open" for s in raw_src_list},
+                "errors": errors,
             }
 
         progress_by_source = {}
@@ -764,10 +885,10 @@ async def search(
                 if total_items >= CONF["fast_return_items"]:
                     skipped_fast_return = True
                     break
-                # 已有任意源出结果：再给其余源最多 slow_grace_s 秒，避免慢源拖死整页
+                # 已有任意源出结果：再给其余源最多 grace 秒，避免慢源拖死整页
                 if total_items > 0:
                     grace_limited = True
-                    deadline = min(deadline, time.monotonic() + CONF["slow_grace_s"])
+                    deadline = min(deadline, time.monotonic() + grace)
         finally:
             for task in pending:
                 task.cancel()
@@ -803,7 +924,10 @@ async def search(
         errors = {src: err for src, _, err in results if err}
         for s in raw_src_list:
             if s not in active_src_list:
-                errors.setdefault(s, "circuit breaker open")
+                # preview-only 排除不是源故障：措辞必须与「被熔断」区分，
+                # 否则 proxy 会把它判成 hard failure（不缓存、对外报源失败）。
+                errors.setdefault(s, "skipped preview-only source" if s in preview_only
+                                  else "circuit breaker open")
         # Partial/error results must remain retryable, not become a long-lived
         # apparently complete cache hit with errors silently removed.
         if not errors:
@@ -863,6 +987,20 @@ async def stream(
     if not url:
         raise HTTPException(502, f"no playable url for {id}")
     url, src_headers = await _maybe_downgrade(id, entry, url, quality, range_header)
+
+    # 预览守卫（change D8）：复用 _maybe_downgrade 内 _head_probe 已解出的秒数，不新增
+    # 下载或 ffmpeg 轮次。整文件都读到、且真实时长 < 元数据 50% → 404 拒绝——
+    # 绝不能走降级语义（want_mp3），否则试听会被降级成 mp3 继续播。
+    ext = str(entry["item"].get("ext") or "").lower()
+    if ext in _PROBE_EXTS:
+        cached = _PROBE_CACHE.get(id)
+        seconds = cached[2] if cached and len(cached) > 2 else None
+        complete = bool(cached[3]) if cached and len(cached) > 3 else False
+        metadata_s = float(entry["item"].get("duration_s") or 0)
+        if _preview_probe_reject(seconds, metadata_s, complete):
+            logger.warning("preview stream rejected for %s (decoded=%ss meta=%ss)", id, seconds, metadata_s)
+            raise HTTPException(404, f"online source unavailable for {id!r} (preview stream)")
+
     if not proxy:
         return RedirectResponse(url, status_code=302)
 

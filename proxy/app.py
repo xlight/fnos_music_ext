@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import contextlib
 import threading
 from collections import OrderedDict
@@ -249,6 +250,23 @@ CONF = {
     "lx_probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "3.0")),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "30")),
+    # 回退搜索预算：默认 18s。musicdl 一次聚合搜索在多源配置下实测 5-15s
+    # （CT201：11 源冷缓存约 7-11s，因为每个源的 worker 要起进程再逐条探活），
+    # 预算小于搜索耗时则回退永远超时、等于功能不存在（实测 12s 预算下
+    # 网易 167691 恰好卡在 12.001s 超时 → 404）。首播总墙钟上限仍由
+    # FNMUSIC_STREAM_TOTAL_MAX_S（20s）兜底，所以预算可以放大到 18s。
+    "fallback_timeout": float(os.environ.get("FNMUSIC_FALLBACK_TIMEOUT", "18.0")),
+    # 回退搜索的每源条数上限：回退只需要"第一条可用结果"，但 musicdl 的
+    # search_probe 会逐条探活，limit 越大探得越久——CT201 实测同一关键词
+    # limit=5 约 5s、limit=10 约 13s、limit=30 约 12s（冷缓存）。
+    # 回退用小 limit 才能落在 FNMUSIC_FALLBACK_TIMEOUT 预算内。
+    "fallback_limit": int(os.environ.get("FNMUSIC_FALLBACK_LIMIT", "5")),
+    # 回退搜索的慢源宽限（秒）：musicdl 服务端默认「首个源出结果后再等 2s」，
+    # 11 源配置下只等得到第一个响应源（实测只拿到 1 条 120s 试听）。
+    # 回退要慢源的结果（Kuwo/咪咕等才有同名全长版），所以单独放宽到 8s。
+    "fallback_grace_s": float(os.environ.get("FNMUSIC_FALLBACK_GRACE_S", "8.0")),
+    # 首播总墙钟上限（含取链 + 回退搜索 + 候选尝试），默认 20s
+    "stream_total_max_s": float(os.environ.get("FNMUSIC_STREAM_TOTAL_MAX_S", "20.0")),
     "search_empty_retry": int(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY", "1")),
     "search_empty_retry_delay": float(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY_DELAY", "1.2")),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
@@ -372,6 +390,263 @@ class _SupersededSearch:
 
 
 _SUPERSEDED = _SupersededSearch()
+
+# NetEase 回退搜索的 fetch scope：与 _recover_source 的 ":play" 隔离，避免同 scope 不同
+# keyword 互相 supersede（SourceSearchGate._admit 行为）导致回退静默无结果。
+_FALLBACK_SCOPE_SUFFIX = ":play:fallback"
+_FALLBACK_CACHE_TTL_S = 300.0
+# 回退冷却窗口（秒）：同一曲目短时间内不重复发起回退搜索，避免上游被反复打。
+_FALLBACK_COOLDOWN_S = 30.0
+
+
+def _fallback_scope(request: Request, keyword: str) -> str:
+    """回退搜索的 fetch scope：**按 keyword 分片**。
+
+    SourceSearchGate._admit 对「同 scope 不同 keyword」会置 superseded，先发的一方
+    静默拿到 _SUPERSEDED → 无回退 → 404。同一用户的两个不同曲目同时回退必须互不
+    干扰，所以 scope 必须带 keyword 指纹：
+    - 同曲目同 scope → 单飞（只搜一次、共享结果）；
+    - 不同曲目不同 scope → 互不 supersede；
+    - 与 _recover_source 的 ":play" 不同 scope → 互不干扰。
+    """
+    fingerprint = hashlib.sha1(keyword.encode("utf-8", "ignore")).hexdigest()[:12]
+    return _credential_scope(request) + _FALLBACK_SCOPE_SUFFIX + ":" + fingerprint
+
+
+def _fallback_cache_entry(cache_key: str) -> dict | None:
+    """回退缓存条目（未过期才返回）。"""
+    entry = _SEARCH_CACHE.get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+    try:
+        ttl = float(entry.get("ttl", _FALLBACK_CACHE_TTL_S))
+    except (TypeError, ValueError):
+        ttl = _FALLBACK_CACHE_TTL_S
+    if time.time() - entry.get("accessed", entry.get("ts", 0)) >= ttl:
+        return None
+    return entry
+
+
+def _fallback_search_limit() -> int:
+    """回退搜索的每源条数（默认 5）。
+
+    回退只需要"第一条可用结果"，而 musicdl 的 search_probe 会逐条探活：
+    CT201 实测同一关键词 limit=5 约 5s、limit=10 约 13s、limit=30 约 12s
+    （11 源、冷缓存）。条数越多越容易撞穿 FNMUSIC_FALLBACK_TIMEOUT 预算 →
+    回退恒空。默认取小 limit，用户可用 FNMUSIC_FALLBACK_LIMIT 调整。
+    """
+    try:
+        return max(1, min(30, int(CONF.get("fallback_limit") or 5)))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _fallback_grace_s() -> float:
+    """回退搜索的慢源宽限（默认 8s，服务端上限 15s）。
+
+    musicdl 服务端默认「首个源出结果后再等 2s」；11 源配置下 worker 启动
+    就要 3-5s，2s 宽限只等得到第一个响应源——CT201 实测回退只拿到 1 条
+    120s 试听（sgogo），而同名全长版在 Kuwo/咪咕（7-10s 才交结果）。
+    """
+    raw = CONF.get("fallback_grace_s")
+    if raw is None:
+        raw = 8.0
+    try:
+        return max(0.0, min(15.0, float(raw)))
+    except (TypeError, ValueError):
+        return 8.0
+
+
+def _fallback_norm(text: Any) -> str:
+    """标题/歌手归一化：NFKC（全角→半角）+ 去空白 + 小写。"""
+    norm = unicodedata.normalize("NFKC", str(text or "")).strip().lower()
+    return re.sub(r"\s+", "", norm)
+
+
+def _fallback_item_duration(item: dict) -> float:
+    try:
+        return float(item.get("duration_s") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fallback_pick_item(items: list, title: str, artist: str,
+                         duration_s: float | None = None) -> dict | None:
+    """从回退结果里挑最贴近原曲的一条（挑不到就退回第一条）。
+
+    为什么不能直接取第一条：musicdl 的聚合结果按"音源优先级 + 音质"排序，
+    第一条常常是**别的版本**（CT201 实测网易「天龙八部之宿敌」→ 回退命中
+    「天龙八部之宿敌 (2026安泊猜想巡回演唱会成都站现场)」63s 现场版，
+    而同名录音室版在第 5 条）。命中现场版/伴奏版/DJ 版 = 用户听到的不是
+    他点的那首歌。
+
+    选法（保守，宁可退回第一条也不猜）：
+    1. 标题归一化后**完全相同** → 标题权重 0；标题**互相包含** → 权重 1；
+       其余不参与；
+    2. 歌手归一化后互相包含（空值不判负）才参与；
+    3. 时长：已知且不足原时长一半 → 判试听片段，**剔除**；已知且贴近
+       （±15% 或 ±8s）→ 时长权重 0；已知但不贴近 → 权重 1；未知（0）→ 权重 2
+       （CT201 实测 sgogo 的「天龙八部之宿敌」是 120s 试听且元数据时长为空，
+       必须排在有真实时长的同名条目之后）；
+    4. 按（标题权重, 时长权重）取最小，同权重保持原始顺序；都不满足 → 第一条。
+    """
+    if not items:
+        return None
+    want_title = _fallback_norm(title)
+    want_artist = _fallback_norm(artist)
+    if not want_title:
+        return items[0] if isinstance(items[0], dict) else None
+    try:
+        want_dur = float(duration_s or 0.0)
+    except (TypeError, ValueError):
+        want_dur = 0.0
+    best_key = None
+    best_item = None
+    for order, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        cand_title = _fallback_norm(item.get("title"))
+        cand_artist = _fallback_norm(item.get("artist"))
+        if not cand_title:
+            continue
+        if cand_title == want_title:
+            title_rank = 0
+        elif want_title in cand_title or cand_title in want_title:
+            title_rank = 1
+        else:
+            continue
+        if want_artist and cand_artist and not (want_artist in cand_artist
+                                                or cand_artist in want_artist):
+            continue
+        dur = _fallback_item_duration(item)
+        if want_dur > 0 and dur > 0 and dur < want_dur * 0.5:
+            continue  # 不到原时长一半 → 试听片段
+        if dur <= 0:
+            dur_rank = 2
+        elif want_dur > 0 and abs(dur - want_dur) <= max(8.0, want_dur * 0.15):
+            dur_rank = 0
+        else:
+            dur_rank = 1
+        key = (title_rank, dur_rank, order)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_item = item
+    if best_item is not None:
+        return best_item
+    return items[0] if isinstance(items[0], dict) else None
+
+
+async def _netease_fallback_search(request: Request, guid: str, title: str, artist: str,
+                                   entry: dict | None = None,
+                                   budget: float | None = None,
+                                   duration_s: float | None = None) -> str | None:
+    """跨源回退：NetEase 源失败时在默认启用音源中按 title+artist 再搜一轮。
+
+    并发单飞复用 fetch_musicdl_search 内部的 _MUSICDL_SEARCH_GATE，不新增调度状态；
+    结果按交互搜索条目形状写入 _SEARCH_CACHE（netease-fallback: 前缀，300s TTL），
+    供 307 之后的 _retained_track 命中元数据与 _alternatives。
+    条目挑选见 _fallback_pick_item（优先同名同歌手、时长贴近的版本）。
+    """
+    keyword = f"{title} {artist}".strip()
+    if not keyword or not CONF.get("musicdl_enabled"):
+        fn_diag(logger, "netease_fallback_skip", guid=guid, reason="musicdl_disabled")
+        return None
+    scope = _credential_scope(request)
+    # 缓存 key 必须带凭据隔离：否则不同用户的同歌同曲名互相覆盖，
+    # 被覆盖方的 _retained_track 落空 → 307 后丢元数据与 _alternatives。
+    cache_key = f"netease-fallback:{scope}:{title.strip()}:{artist.strip()}"
+    # 先读后写：命中未过期的缓存条目直接复用，不再发起上游搜索。
+    cached = _fallback_cache_entry(cache_key)
+    if cached is not None:
+        items = cached.get("items")
+        if isinstance(items, list) and items:
+            picked = _fallback_pick_item(items, title, artist, duration_s)
+            cached_guid = online_guid_from_item(picked) if isinstance(picked, dict) else None
+            if cached_guid:
+                fn_diag(logger, "netease_fallback_hit", guid=guid, fallback=cached_guid,
+                        source=source_from_online_guid(cached_guid),
+                        items=len(items), cached=True)
+                return cached_guid
+    # 冷却：时间戳写在**被命中的原 entry**（网易那条 retained entry）上，
+    # 写进新建的 fallback entry 没人读，等于没有冷却。
+    cooldown_key = "fallback:" + (source_from_online_guid(guid) or "netease")
+    if entry is not None:
+        try:
+            last = float(entry.get(cooldown_key, -1000))
+        except (TypeError, ValueError):
+            last = -1000
+        if time.monotonic() - last < _FALLBACK_COOLDOWN_S:
+            fn_diag(logger, "netease_fallback_skip", guid=guid, reason="cooldown")
+            return None
+        entry[cooldown_key] = time.monotonic()
+    token = _FETCH_SCOPE.set(_fallback_scope(request, keyword))
+    started = time.monotonic()
+    search_budget = max(1.0, float(budget if budget is not None
+                                    else (CONF.get("fallback_timeout") or 18.0)))
+    try:
+        try:
+            result = await asyncio.wait_for(
+                fetch_musicdl_search(get_musicdl_client(request.app), keyword,
+                                     _fallback_search_limit(),
+                                     grace_s=_fallback_grace_s()),
+                timeout=search_budget,
+            )
+        except asyncio.TimeoutError:
+            fn_diag(logger, "netease_fallback_failed", guid=guid, reason="search_timeout",
+                    budget=search_budget,
+                    ms=int((time.monotonic() - started) * 1000))
+            return None
+        except Exception as exc:
+            fn_diag(logger, "netease_fallback_failed", guid=guid,
+                    reason=type(exc).__name__, ms=int((time.monotonic() - started) * 1000))
+            return None
+        if result is _SUPERSEDED:
+            fn_diag(logger, "netease_fallback_failed", guid=guid, reason="superseded",
+                    ms=int((time.monotonic() - started) * 1000))
+            return None
+        if not result or not isinstance(result, dict):
+            fn_diag(logger, "netease_fallback_failed", guid=guid, reason="empty_result",
+                    ms=int((time.monotonic() - started) * 1000))
+            return None
+        items = result.get("items")
+        if not isinstance(items, list) or not items:
+            fn_diag(logger, "netease_fallback_failed", guid=guid, reason="no_items",
+                    ms=int((time.monotonic() - started) * 1000))
+            return None
+        _set_search_cache(cache_key, {
+            "items": items,
+            "ts": time.time(),
+            "keyword": keyword,
+            "scope": scope,
+            "credentials": scope,
+            "config": _source_config(),
+            "task": None,
+            "deep_round": 1,
+            "exhausted": set(),
+            "extend_task": None,
+            "accessed": time.time(),
+            "ttl": _FALLBACK_CACHE_TTL_S,
+        })
+        first = _fallback_pick_item(items, title, artist, duration_s)
+        fallback_guid = online_guid_from_item(first) if isinstance(first, dict) else None
+        fn_diag(logger, "netease_fallback_hit", guid=guid, fallback=fallback_guid or "",
+                source=source_from_online_guid(fallback_guid or ""),
+                items=len(items), ms=int((time.monotonic() - started) * 1000))
+        return fallback_guid
+    finally:
+        _FETCH_SCOPE.reset(token)
+
+
+async def _netease_fallback_meta(request: Request, guid: str, budget: float = 2.0) -> dict | None:
+    """回退元数据：优先内存会话链，缺失时复用 _fetch_online_info（走网易系双客户端）。"""
+    meta = _online_meta_for_request(request, guid)
+    if meta is not None:
+        return meta
+    try:
+        return await asyncio.wait_for(
+            _fetch_online_info(request, guid, include_lyric=False), timeout=max(0.0, budget))
+    except Exception:
+        return None
 
 
 class SourceSearchGate:
@@ -580,7 +855,7 @@ def _search_ttl(entry: dict) -> float:
 def _clean_search_cache() -> None:
     now = time.time()
     try:
-        expired = [k for k, v in _SEARCH_CACHE.items() if now - v.get("accessed", v.get("ts", 0)) >= 900]
+        expired = [k for k, v in _SEARCH_CACHE.items() if now - v.get("accessed", v.get("ts", 0)) >= float(v.get("ttl", 900))]
         if len(_SEARCH_CACHE) > 2000:
             expired += sorted(_SEARCH_CACHE,
                               key=lambda k: _SEARCH_CACHE.get(k, {}).get("accessed", 0))[:1000]
@@ -627,6 +902,14 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "LX_PROBE_TIMEOUT": ("lx_probe_timeout", "lx_timeout"),
     "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
+    # 回退搜索预算（秒，1-60）：网易取链失败后的跨源搜索预算，改完热重载即生效
+    "FNMUSIC_FALLBACK_TIMEOUT": ("fallback_timeout", "seconds"),
+    # 回退搜索的每源条数（1-30）：回退只需第一条可用结果，条数越少探活越快
+    "FNMUSIC_FALLBACK_LIMIT": ("fallback_limit", "fallback_limit"),
+    # 回退搜索的慢源宽限（秒，0-15）：默认 8，让慢源也交出结果
+    "FNMUSIC_FALLBACK_GRACE_S": ("fallback_grace_s", "seconds"),
+    # 首播总墙钟上限（秒，5-300）：含取链 + 回退搜索 + 候选尝试
+    "FNMUSIC_STREAM_TOTAL_MAX_S": ("stream_total_max_s", "total_budget_s"),
     "FNMUSIC_PLAY_QUALITY": ("play_quality", "play_quality"),
     "FNMUSIC_DOWNLOAD_QUALITY": ("download_quality", "download_quality"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
@@ -801,6 +1084,16 @@ def _env_watch_parse(raw: str, kind: str):
     if kind == "seconds":
         try:
             return max(1.0, min(60.0, float(raw)))
+        except (TypeError, ValueError):
+            return None
+    if kind == "total_budget_s":
+        try:
+            return max(5.0, min(300.0, float(raw)))
+        except (TypeError, ValueError):
+            return None
+    if kind == "fallback_limit":
+        try:
+            return max(1, min(30, int(raw)))
         except (TypeError, ValueError):
             return None
     if kind == "lx_timeout":
@@ -1993,6 +2286,14 @@ def title_from_track(item: dict) -> str:
 _LX_STREAM_STARTUP_SLACK_S = 5.0
 _LX_URL_REQUEST_SLACK_S = 1.0
 _STREAM_STARTUP_S = 12.0
+
+
+def _stream_total_max_s() -> float:
+    """首播总墙钟上限（含取链 + 回退搜索 + 候选尝试），默认 20s。"""
+    try:
+        return max(5.0, min(300.0, float(CONF.get("stream_total_max_s") or 20.0)))
+    except (TypeError, ValueError):
+        return 20.0
 
 
 def _lx_url_request_timeout_s() -> float:
@@ -3498,7 +3799,9 @@ async def fetch_upstream_envelope(request: Request, client: httpx.AsyncClient) -
     return payload
 
 
-async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: int, sources: str | None = None) -> dict | None:
+async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: int,
+                               sources: str | None = None,
+                               grace_s: float = 0.0) -> dict | None:
     if not keyword:
         return None
     scope = _FETCH_SCOPE.get()
@@ -3529,6 +3832,9 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
         selected_sources = CONF["online_sources"] if sources is None else sources
         if selected_sources:
             params["sources"] = selected_sources
+        if grace_s > 0:
+            # 回退搜索要慢源的结果（默认宽限 2s 只等得到第一个响应源）
+            params["grace_s"] = round(min(15.0, float(grace_s)), 3)
         timeout = max(1.0, float(CONF.get("search_timeout") or 15))
         # 空结果重试统一在聚合层（_aggregate_search，最多一次、计入原搜索预算、
         # 取消/换词后不重试）；这里不再内嵌第二轮，避免两层重试叠加拖穿预算。
@@ -4515,6 +4821,13 @@ async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str,
                         url = inner.get("url")
                         if code not in (200, 404):
                             return None
+                        # 上游字段判试听（change D7）：freeTrialInfo 明示只给试听片段
+                        # （未登录取 VIP 歌的典型形态）→ 判不可播，让回退接手。
+                        # 字段权威：不新增网络请求，也不猜时长。
+                        if code == 200 and url and inner.get("freeTrialInfo"):
+                            fn_diag(logger, "netease_trial_rejected", song_id=key, quality=q)
+                            code = 404
+                            url = None
                         if code == 200 and url:
                             url = str(url)
                             if not url.startswith(("http://", "https://")):
@@ -9279,11 +9592,29 @@ async def stream_track(request: Request, subpath: str = ""):
     item, entry = _retained_track(request, guid)
     candidates = [guid]
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
+    # 回退候选同样只允许起播请求（无 Range 或 bytes=0-）：中途 Range 跨源重定向会把
+    # 一个文件的字节偏移套到另一个文件上，表现为错位断流或跳歌。
+    fallback_allowed = (
+        is_range_from_zero_or_none(range_header)
+        and request.query_params.get("_ext_rendition") != "1"
+    )
     if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
         candidates += [online_guid_from_item(x) for x in ordered_stream_alternatives(item)]
-    deadline = asyncio.get_running_loop().time() + (
+    loop_started_at = asyncio.get_running_loop().time()
+    deadline = loop_started_at + (
         _lx_stream_startup_timeout_s() if source_from_online_guid(guid) == "lx" else _STREAM_STARTUP_S)
-    for candidate in list(dict.fromkeys(candidates))[:3]:
+    fallback_engaged = False
+    # 搜索"发起"即置位（fallback_attempted）：保证一次请求最多搜一次，
+    # 不依赖"找到候选就 break"的隐式控制流。
+    fallback_attempted = False
+    # 基础候选上限 4（guid + 最多 3 条 alternatives）；回退候选额外占 1 个位置，
+    # 否则"已有 3 条 alternatives"时回退 guid 会被静默截断 → 功能失效。
+    candidate_list = list(dict.fromkeys(candidates))[:4]
+    max_candidates = 4
+    _ci = 0
+    while _ci < min(len(candidate_list), max_candidates):
+        candidate = candidate_list[_ci]
+        _ci += 1
         if not _source_enabled(candidate):
             continue
         if source_from_online_guid(candidate) == "lx":
@@ -9354,6 +9685,45 @@ async def stream_track(request: Request, subpath: str = ""):
                     scan_headers_factory=lambda: copy_incoming_headers(request),
                     post_finalize=lambda meta: _auto_lyric_after_finalize(request, candidate, meta),
                     retained_factory=lambda: _retained_track(request, candidate)[0] or _online_meta_get(candidate))
+            if source_from_online_guid(candidate) == "netease" and not fallback_attempted:
+                # NetEase resolve 失败（_open_online_stream 返回 None）时的跨源回退。
+                # 仅当 pin 未被"弃钉"（pin[1]==0 表示可 refresh 恢复）时才回退，
+                # 避免与 dead-pin refresh 路径冲突（见 test_netease_dead_pin_refresh）。
+                if fallback_allowed:
+                    _sid = song_id_from_online_guid(candidate).split(":")[-1]
+                    _pin = _NETEASE_URL_PIN.get(_sid)
+                    _dropped = bool(_pin is not None and _pin[1] == 0.0)
+                    if _dropped:
+                        fn_diag(logger, "netease_fallback_skip", guid=candidate, reason="pin_dropped")
+                    if not _dropped:
+                        # 先算 re-arm 后的 deadline：元数据与搜索预算都要夹在它之内，
+                        # 否则"resolve + meta + search"会突破 _STREAM_TOTAL_MAX_S。
+                        _now = asyncio.get_running_loop().time()
+                        _fallback_budget = max(1.0, float(CONF.get("fallback_timeout") or 18.0))
+                        _armed_deadline = min(_now + _fallback_budget + 6.0,
+                                              loop_started_at + _stream_total_max_s())
+                        _remaining = max(0.0, _armed_deadline - _now)
+                        meta = await _netease_fallback_meta(request, candidate,
+                                                             budget=min(2.0, _remaining))
+                        if meta is None:
+                            fn_diag(logger, "netease_fallback_skip", guid=candidate, reason="meta_missing")
+                        else:
+                            # 搜索"发起"即置位：不能只在找到候选时置位，否则空结果
+                            # 时下一个 attempt 会再搜一次。
+                            fallback_attempted = True
+                            fallback_guid = await _netease_fallback_search(
+                                request, candidate,
+                                str(meta.get("title") or ""), str(meta.get("artist") or ""),
+                                entry=entry,
+                                budget=min(_fallback_budget, _remaining),
+                                duration_s=meta.get("duration_s"))
+                            if fallback_guid and fallback_guid != candidate and fallback_guid not in candidate_list:
+                                candidate_list.append(fallback_guid)
+                                candidates.append(fallback_guid)
+                                max_candidates = len(candidate_list)
+                                fallback_engaged = True
+                                deadline = _armed_deadline
+                                break
             if attempt or deadline - asyncio.get_running_loop().time() <= 3:
                 break
             if source_from_online_guid(candidate) == "netease":
@@ -9366,8 +9736,8 @@ async def stream_track(request: Request, subpath: str = ""):
             # 直链源的 URL 刷新不依赖搜索缓存；收藏/重启/缓存过期也可有界重试。
     # issue #51/#52：搜到但不能播的最终结局留档（候选源、启用状态）
     fn_diag(logger, "stream_unresolved", guid=guid,
-            candidates=",".join(list(dict.fromkeys(candidates))[:3]),
-            enabled=",".join(c for c in list(dict.fromkeys(candidates))[:3] if _source_enabled(c)) or "none")
+            candidates=",".join(list(dict.fromkeys(candidates))[:4]),
+            enabled=",".join(c for c in list(dict.fromkeys(candidates))[:4] if _source_enabled(c)) or "none")
     return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
 
 
