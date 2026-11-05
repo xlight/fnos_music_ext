@@ -11968,6 +11968,23 @@ def _enabled_chart_ids() -> set[str]:
     return {str(m.get("id") or "") for m in _enabled_chart_metas()} - {""}
 
 
+def _build_chart_track_vo(rows: list[dict]) -> list[dict]:
+    """榜单缓存里存的是音源原始行；出列表前统一转成飞牛曲目 VO（与公共歌单同款
+    build_online_track）。原始行直接下发会让前端 renderRow 读到 null 字段崩溃。"""
+    out: list[dict] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if "audioSpec" in r:  # 已是 VO
+            out.append(r)
+            continue
+        try:
+            out.append(build_online_track(r))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("chart track build failed: %s", e)
+    return out
+
+
 def _recommend_kinds_enabled() -> list[str]:
     """按开关返回要注入的推荐歌单类型（顺序即歌单列表顺序）。"""
     return [k for k in ("daily", "liked", "hot", "category", "custom") if _recommend_kind_enabled(k)]
@@ -12831,7 +12848,7 @@ async def playlist_detail(request: Request):
         except Exception as e:  # noqa: BLE001
             logger.warning("chart %s detail failed: %s", cid, e)
             tracks = []
-        tracks = dailyrec.stamp_playlist_tracks(tracks)
+        tracks = dailyrec.stamp_playlist_tracks(_build_chart_track_vo(tracks))
         register_online_meta(tracks)
         card = chartrec.build_chart_playlist_record(cid, len(tracks))
         fake_official_guid(guid)
@@ -12976,7 +12993,7 @@ async def playlist_batch_detail(request: Request):
                 cached = chartrec.load_chart_cache(cid, dailyrec.today_key()) or []
                 card = chartrec.build_chart_playlist_record(cid, len(cached))
                 fake_official_guid(str(card.get("guid") or ""))
-                recs.append(_playlist_public_fields(card, cached))
+                recs.append(_playlist_public_fields(card, _build_chart_track_vo(cached)))
             continue
         if kind == "category":
             cid = (g.split(":", 3)[-1].split(":")[0] if g.startswith(dailyrec.CATEGORY_GUID_PREFIX) else "")
@@ -13135,7 +13152,7 @@ async def playlist_track_list(request: Request):
         except Exception as e:  # noqa: BLE001
             logger.warning("chart %s tracks failed: %s", cid, e)
             return JSONResponse(content={"code": -1, "msg": "chart load failed", "data": None})
-        tracks = dailyrec.stamp_playlist_tracks(tracks)
+        tracks = dailyrec.stamp_playlist_tracks(_build_chart_track_vo(tracks))
         register_online_meta(tracks)
         try:
             page = max(int(request.query_params.get("page") or 1), 1)

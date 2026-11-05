@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import time
 
@@ -1871,7 +1872,8 @@ def test_chart_playlists_injected_in_list_detail_and_tracks(tmp_path, monkeypatc
     cid = chartrec.KG_CHARTS[0]["id"]
     day = chartrec._today()
     seed_tracks = [
-        {"guid": f"online:kg:{cid}-{i}", "title": f"榜歌{i}", "artist": "歌手", "album": "专辑"}
+        {"id": f"lx:kg:{cid}-{i}", "source": "lx", "title": f"榜歌{i}", "artist": "歌手",
+         "album": "专辑", "duration_s": 200, "ext": "mp3", "cover_url": "http://x/c.jpg"}
         for i in range(3)
     ]
     chartrec.save_chart_cache(cid, day, seed_tracks, cover_url="http://x/c.jpg")
@@ -1907,7 +1909,16 @@ def test_chart_playlists_injected_in_list_detail_and_tracks(tmp_path, monkeypatc
         assert tl["code"] == 0
         assert tl["data"]["total"] == 3
         assert len(tl["data"]["list"]) == 3
-        assert tl["data"]["list"][0]["title"] == "榜歌0"
+        first = tl["data"]["list"][0]
+        assert first["title"] == "榜歌0"
+        # 曲目必须是飞牛 VO（与公共歌单同款 build_online_track）：原始行直接下发
+        # 会让前端 renderRow 读到 null 字段崩溃（Cannot read properties of null）。
+        # guid 出口统一伪装为官方 32-hex（disguise_client_json，与公共歌单一致）
+        assert re.fullmatch(r"[0-9a-f]{32}", str(first["guid"]))
+        assert isinstance(first["album"], dict) and first["album"].get("guid")
+        assert isinstance(first["artists"], list) and isinstance(first["artists"][0], dict)
+        assert isinstance(first["audioSpec"], dict) and first["audioSpec"].get("path")
+        assert isinstance(first["audioSpec"]["duration"], int)
 
         # 4) 白名单收敛：只保留一个不存在的 id → 无榜单卡片，detail 返回 not found
         monkeypatch.setitem(CONF, "enabled_charts", "wy_not_exist")
