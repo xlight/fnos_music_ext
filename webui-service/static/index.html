@@ -23,6 +23,7 @@
       <nav class="nav" id="nav">
         <button class="nav-item active" data-page="overview">概览</button>
         <button class="nav-item" data-page="source">音乐源</button>
+        <button class="nav-item" data-page="completion">整曲补全</button>
         <button class="nav-item" data-page="playlist">歌单</button>
         <button class="nav-item" data-page="llm">大模型</button>
         <button class="nav-item" data-page="tee">边听边存</button>
@@ -53,6 +54,13 @@
         <div class="card" id="ov-lx-card" hidden>
           <div class="card-title">洛雪自定义源</div>
           <div id="ov-lx" class="stack"></div>
+        </div>
+        <div class="card" id="ov-completion-card" hidden>
+          <div class="card-title">最近补全（近 200 次内）</div>
+          <div id="ov-completion" class="stack"></div>
+          <div class="btn-row">
+            <button class="btn small" id="ov-completion-open" type="button">查看全部</button>
+          </div>
         </div>
       </section>
 
@@ -262,7 +270,7 @@
             <input class="input" id="search-deep-max" type="number" min="1" max="50" step="1" inputmode="numeric">
           </label>
         </div>
-      
+
 
         <h3 class="sub-h2">lx音乐源</h3>
         <p class="hint">仅当洛雪是主音源时影响播放。打开本页或在其他主音源下保存偏好，不会启动洛雪服务。</p>
@@ -282,6 +290,49 @@
         </div>
       
       </section>
+      <!-- 补全：整曲补全配置 + 补全记录（独立左侧菜单 section） -->
+      <section class="page" id="page-completion">
+        <h2><span>整曲补全</span><button class="help-btn" type="button" data-help="completion" aria-label="整曲补全帮助">?</button></h2>
+        <div class="card">
+          <div class="card-title"><span>整曲补全</span><button class="help-btn" type="button" data-help="completion" aria-label="整曲补全帮助">?</button></div>
+          <label class="switch-row"><span>启用整曲补全（用其它音源补齐不能整曲播放的曲目）</span><input type="checkbox" id="completion-enabled"></label>
+          <p class="hint">仅在账号型音源（网易盒子 / 免扫码）给不出完整曲时生效，需要 musicdl 已启用；默认关闭——换源会改变实际听到的版本。保存后热重载生效。[VIP] 标记不等于放不出来：开启后标 [VIP] 的歌可能由其它音源补全整曲。</p>
+        </div>
+        <div class="card">
+          <label class="field"><span>补全搜索预算（秒）</span>
+            <input class="input" id="completion-timeout" type="number" min="1" max="60" step="any" inputmode="decimal">
+          </label>
+          <label class="field"><span>每源候选条数</span>
+            <input class="input" id="completion-limit" type="number" min="1" max="30" step="1" inputmode="numeric">
+          </label>
+          <label class="field"><span>慢源宽限（秒，0=不等慢源）</span>
+            <input class="input" id="completion-grace" type="number" min="0" max="15" step="any" inputmode="decimal">
+          </label>
+          <label class="field"><span>首播总时长上限（秒）</span>
+            <input class="input" id="completion-total-max" type="number" min="5" max="300" step="any" inputmode="decimal">
+          </label>
+          <p class="hint">补全搜索预算受首播总时长上限约束（超过会被夹紧）；条数越少探活越快，越多越容易超时。保存后约 3 秒内热重载生效。</p>
+        </div>
+        <div class="card">
+          <div class="card-title">
+            <span>补全记录</span>
+            <button class="btn small" id="completion-refresh" type="button">刷新</button>
+          </div>
+          <p class="hint" id="completion-note">最近的整曲补全尝试（命中 / 未命中 / 跳过及原因）。</p>
+          <table class="data-table" id="completion-table" hidden>
+            <thead><tr><th>时间</th><th>曲目 · 歌手</th><th>原音源</th><th>结果（含命中音源）</th><th>耗时</th></tr></thead>
+            <tbody id="completion-tbody"></tbody>
+          </table>
+          <div class="btn-row">
+            <button class="btn small" id="completion-prev">上一页</button>
+            <span id="completion-page" class="muted">1</span>
+            <button class="btn small" id="completion-next">下一页</button>
+          </div>
+        </div>
+
+
+      </section>
+
       <!-- 歌单（列表 + 侧边详情面板） -->
       <section class="page" id="page-playlist">
         <h2>歌单</h2>
@@ -589,6 +640,7 @@
   <nav class="bottom-nav" id="bottom-nav">
     <button class="nav-item active" data-page="overview">概览</button>
     <button class="nav-item" data-page="source">音乐源</button>
+    <button class="nav-item" data-page="completion">补全</button>
     <button class="nav-item" data-page="playlist">歌单</button>
     <button class="nav-item" data-page="llm">大模型</button>
     <button class="nav-item" data-page="tee">边听边存</button>
@@ -656,7 +708,14 @@
   </template>
   <template data-help-id="search">
     <p>深分页在在线歌曲不够填满当前页时继续取下一页，本地歌曲始终排在最前；musicdl 不支持分页，仅参与首屏。关闭后只显示首次搜索结果。</p>
-    <p>搜索超时默认 15 秒，到时未返回就只交本地结果。深分页页数上限默认 10，防止无限翻页打爆音源。</p>
+    <p>搜索超时默认 30 秒，到时未返回就只交本地结果。深分页页数上限默认 10，防止无限翻页打爆音源。</p>
+  </template>
+  <template data-help-id="completion">
+    <p>账号型音源（网易盒子 / 免扫码）拿不到完整曲时——VIP 无权益、版权下架、或上游只给 30s 试听片段——开启后会自动在其它已启用音源里找同名曲目并替换播放（307 跳转，客户端无感知）。需要 musicdl 已启用。</p>
+    <p>默认关闭：换源会改变实际听到的版本（可能是另一个音源的另一个版本），由你主动开启。关闭只影响跨源替换，不会把试听片段当全曲放出来。</p>
+    <p>[VIP] 标记不等于放不出来：开启后标 [VIP] 的歌可能由其它音源补全整曲。</p>
+    <p>四个参数：补全搜索预算（一次跨源搜索给多少秒，受首播总时长上限约束）、每源候选条数（越少探活越快）、慢源宽限（首个源出结果后再等多久）、首播总时长上限（含取链+补全的总墙钟硬上限）。保存后热重载生效。</p>
+    <p>下方「补全记录」列出最近的补全尝试：命中（换到了哪个音源）、未命中、跳过及原因（开关关闭 / 音源未启用 / 冷却中等），概览页也有摘要。</p>
   </template>
   <template data-help-id="tee-save">
     <p>边听边存开启时，代理完整获取的在线歌曲会自动保存到本地曲库，不必听完整首。关闭后仅保留滚动缓存；restore 会一并清理这些滚动缓存。</p>

@@ -54,6 +54,7 @@ from proxy.fnlog import (  # noqa: E402
     setup_logging,
 )
 from proxy import llm_usage  # noqa: E402  # 每日大模型 token 账本（纯 stdlib）
+from proxy import completion_log  # noqa: E402  # 整曲补全记录账本（纯 stdlib）
 from proxy import customplaylists as custompl
 from proxy import publicplaylists as pubpl
 from proxy import recommend as dailyrec
@@ -251,10 +252,12 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LIKED_REFRESH_HOURS": {"kind": "float", "default": "0.5", "min": 0.5, "step": "any", "group": "llm", "reload": "hot", "label": "猜你喜欢生成间隔（小时）"},
     "FNMUSIC_LIKED_SIZE": {"kind": "int", "default": "20", "min": 0, "max": 100, "strict": True, "group": "llm", "reload": "hot", "label": "猜你喜欢歌曲数量"},
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "30", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
-    "FNMUSIC_FALLBACK_TIMEOUT": {"kind": "float", "default": "18", "min": 1, "max": 60, "step": "any", "group": "search", "reload": "hot", "label": "网易回退搜索预算(秒)"},
-    "FNMUSIC_FALLBACK_LIMIT": {"kind": "int", "default": "5", "min": 1, "max": 30, "strict": True, "group": "search", "reload": "hot", "label": "网易回退搜索每源条数"},
-    "FNMUSIC_FALLBACK_GRACE_S": {"kind": "float", "default": "8", "min": 0, "max": 15, "step": "any", "group": "search", "reload": "hot", "label": "网易回退搜索慢源宽限(秒)"},
-    "FNMUSIC_STREAM_TOTAL_MAX_S": {"kind": "float", "default": "20", "min": 5, "max": 300, "step": "any", "group": "search", "reload": "hot", "label": "首播总时长上限(秒)"},
+    "FNMUSIC_FALLBACK_TIMEOUT": {"kind": "float", "default": "25", "min": 1, "max": 60, "step": "any", "group": "search", "reload": "hot", "label": "补全搜索预算(秒)"},
+    "FNMUSIC_FALLBACK_LIMIT": {"kind": "int", "default": "5", "min": 1, "max": 30, "strict": True, "group": "search", "reload": "hot", "label": "补全每源候选条数"},
+    "FNMUSIC_FALLBACK_GRACE_S": {"kind": "float", "default": "8", "min": 0, "max": 15, "step": "any", "group": "search", "reload": "hot", "label": "补全慢源宽限(秒)"},
+    "FNMUSIC_STREAM_TOTAL_MAX_S": {"kind": "float", "default": "30", "min": 5, "max": 300, "step": "any", "group": "search", "reload": "hot", "label": "首播总时长上限(秒)"},
+    # 整曲补全总开关：默认关——换源会改变实际听到的版本，由用户主动开启
+    "FNMUSIC_FALLBACK_ENABLED": {"kind": "bool", "default": "false", "group": "search", "reload": "hot", "label": "启用整曲补全（用其它音源补齐不能整曲播放的曲目）"},
     "FNMUSIC_SEARCH_DEEP_PAGE": {"kind": "bool", "default": "true", "group": "search", "reload": "hot", "label": "搜索深分页"},
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": {"kind": "int", "default": "10", "min": 1, "max": 50, "group": "search", "reload": "hot", "label": "深分页页数上限"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
@@ -1618,6 +1621,26 @@ async def _layered_health(request: Request, provider: str,
     return result
 
 
+def _completion_status_summary() -> dict | None:
+    """概览用的整曲补全摘要：{counts, latest, records(最近几条), total}。
+
+    账本缺失/不可用时返回 null（不报错）。records 带最近几条完整记录，
+    让概览卡片能直接展示歌名、命中音源、耗时等完整信息。
+    """
+    try:
+        data = completion_log.summary(limit=5, offset=0, read_only=True)
+    except Exception:
+        return None
+    if not data.get("ok"):
+        return None
+    return {
+        "counts": data.get("counts"),
+        "latest": data.get("latest"),
+        "records": data.get("records") or [],
+        "total": data.get("total"),
+    }
+
+
 @app.get("/api/status")
 async def api_status(request: Request):
     values = read_env()
@@ -1688,6 +1711,8 @@ async def api_status(request: Request):
         "previews": {p: round(preview_seconds_left(p)) for p in list(_preview_until)},
         "services": services,
         "lx_source": lx_source,
+        # 整曲补全摘要（供概览页卡片直接渲染，不多发一次请求）；账本不可用时为 null
+        "completion": await run_in_threadpool(_completion_status_summary),
         # 分段健康：进程/HTTP/列表/脚本/播放五层，各层独立结论。
         # lxmusic 的 /healthz 本轮已取到，直接复用避免重复探活拖慢状态接口。
         "health": await _layered_health(
@@ -2149,6 +2174,20 @@ async def api_llm_usage(limit: int = Query(30, ge=1, le=100), offset: int = Quer
     usage = await run_in_threadpool(
         llm_usage.summary, limit=daily_limit, history_limit=limit, history_offset=offset, read_only=True)
     return {"ok": True, "usage": usage}
+
+
+@app.get("/api/completion")
+async def api_completion(limit: int = Query(30, ge=1, le=100), offset: int = Query(0, ge=0)):
+    """整曲补全记录：新鲜读账本快照（read_only，绝不写盘、不缓存）。
+
+    区分三种状态：有记录 / 无记录（空列表）/ 账本不可用（损坏或读失败 →
+    明确报错，绝不返回假 0）。分页参数带界，避免一次读穿账本。
+    """
+    data = await run_in_threadpool(completion_log.summary, limit=limit, offset=offset, read_only=True)
+    if not data.get("ok"):
+        return JSONResponse(content={"ok": False, "error": data.get("error") or data.get("status"),
+                                     "status": data.get("status")}, status_code=200)
+    return {"ok": True, "completion": data}
 
 
 async def _proxy_lx_source_reorder(request: Request, source_ids: list[str]):

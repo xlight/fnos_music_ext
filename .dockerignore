@@ -18,6 +18,7 @@ proxy/*
 !proxy/publicplaylists.py
 !proxy/version.py
 !proxy/llm_usage.py
+!proxy/completion_log.py
 !proxy/media_url.py
 !proxy/customplaylists.py
 !proxy/recommend.py

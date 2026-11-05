@@ -162,14 +162,16 @@ def test_config_view_merges_defaults(env_file):
         assert f"theme-boot.js?build={webui.STATIC_BUILD_ID}" in page
 
 
-def test_nav_converges_to_six_pages_with_legacy_redirects():
-    """任务 5.1：双导航收敛六项（含大模型），旧路由跳转不 404，settings 主题搬到关于。"""
+def test_nav_converges_to_seven_pages_with_legacy_redirects():
+    """导航收敛七项（概览/音乐源/补全/歌单/大模型/边听边存/关于），旧路由跳转不 404，settings 主题搬到关于。"""
     html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
     import re as _re
     for nav_id in ("nav", "bottom-nav"):
         nav = _re.search(rf'<nav[^>]*id="{nav_id}".*?</nav>', html, _re.S).group(0)
         pages = _re.findall(r'data-page="([^"]+)"', nav)
-        assert pages == ["overview", "source", "playlist", "llm", "tee", "about"], pages
+        assert pages == ["overview", "source", "completion", "playlist", "llm", "tee", "about"], pages
+    # 补全是独立 section
+    assert 'id="page-completion"' in html
     # settings 并入关于：主题 radio 保留在关于页。
     about = _re.search(r'<section[^>]*id="page-about".*?</section>', html, _re.S).group(0)
     assert 'name="theme"' in about
