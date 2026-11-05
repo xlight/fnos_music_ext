@@ -43,6 +43,29 @@
 - 普通 HTTP 且未加密的实际音频（mp3 / flac / m4a / ogg 等）继续通过 `/stream` 与
   `/internal/resolve` 正常交付。
 
+- **Apple 整源排除（只能交付 30–90s 试听片段）**：musicdl 的 `AppleMusicClient`
+  只有两条取链路径——无账号态时 `download_url` 只指向 `attributes.previews[0].url`
+  （官方 30–90s 试听片段）；有 `media-user-token` 时走 VIP 解析，产出的是受保护的
+  `DownloadItem`（HLS/加密），本服务只交付裸 HTTP 媒体直链，无法交付。因此
+  `/search` **恒定**在源级跳过该源（不启动 worker、不计熔断失败、不压自适应预算），
+  也没有 env 逃生口：配 `MUSICDL_APPLE_MEDIA_USER_TOKEN` / `MUSICDL_APPLE_USE_WRAPPER`
+  只会把预览换成不可交付的加密流，不会得到全曲。Apple 全曲需上游 musicdl 支持
+  可交付直链、或本项目自建 Apple 分支之后再放开。预览与全曲共享
+  `audio-ssl.itunes.apple.com` 同族域名，不做 URL 域名拦截。
+
+- **试听守卫只是兜底，源级排除才是主手段**：`/stream` 侧靠"探针已覆盖整文件且
+  实测时长 < 元数据时长 × 0.5"判试听（见 change D8）。该守卫有已知盲区，
+  命中这些盲区时预览仍可能流入播放链路：
+  ① `quality=mp3` 强制降档时 `_maybe_downgrade` 不做探测 → 没有时长 → 放行；
+  ② `ext=mp3` 的源不在 `_PROBE_EXTS` → 从不探测 → 放行；
+  ③ 预览文件大于探针上限 3MB 时只读到前缀（`complete=False`）→ 按规则放行。
+  所以源级排除（Apple）+ 上游字段判定（NetEase `fee`/`freeTrialInfo`）是主手段，
+  守卫只负责兜住"字段没标、但文件明显是短片段"的情况。
+
+- **neteasefree 为 VIP 场景首选，本方案为残余覆盖**：NetEase 播放失败时的跨源回退
+  （`_netease_fallback_search`，musicdl 默认源）只覆盖 neteasefree/musicbox 仍无法
+  解析的残余曲目；neteasefree 后端自带服务端登录态，是 VIP 场景的首选路径。
+
 `musicdl-service/test_sdk_contract.py` 会用固定 wheel 核对本表与真实注册表的
 数量与名称一致；不一致时用例直接失败，不会被悄悄放行。
 

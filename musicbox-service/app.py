@@ -338,7 +338,12 @@ def _playable_recommendation_rows(rows: Any, limit: int) -> list[dict]:
             if sid > 0:
                 ids.append(sid)
     hydrated = _mark_needs_vip(batch_song_details(ids[:100]))
-    playable = filter_playable_song_ids([int(row["song_id"]) for row in hydrated])
+    # 元数据时长（dt）交给可播过滤做试听交叉校验：字段说可播但 CL×8/dt 低于
+    # 真实码率下限的，实际是试听片段，仍然丢（见 change D7b）。
+    durations = {int(row["song_id"]): row.get("duration_ms") for row in hydrated
+                 if row.get("song_id")}
+    playable = filter_playable_song_ids([int(row["song_id"]) for row in hydrated],
+                                        durations or None)
     return [row for row in hydrated if int(row["song_id"]) in playable][:limit]
 
 

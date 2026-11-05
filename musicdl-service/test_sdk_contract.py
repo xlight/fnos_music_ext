@@ -969,7 +969,7 @@ def test_stream_refresh_rechecks_media_delivery(monkeypatch, mode):
     refreshed = {"ts": app_module.time.time(), "item": {
         "id": "kuwo:1", "download_url": "https://cdn.example/new.m3u8", "ext": "m3u8"}}
     monkeypatch.setattr(app_module, "_cache_get", lambda _id: original)
-    monkeypatch.setattr(app_module, "_head_probe_sync", lambda *args: False)
+    monkeypatch.setattr(app_module, "_head_probe_sync", lambda *args: (False, None, False))
 
     async def refresh(_id):
         return refreshed
@@ -1020,16 +1020,17 @@ def test_httpx_decode_probe_reads_bounded_prefix_and_closes(monkeypatch, status,
         def close(self):
             state["client_closed"] = True
 
-    def decode(path):
+    def decode_seconds(path):
         state["decoded"] = True
         assert Path(path).read_bytes().startswith(b"fLaC")
-        return True
+        return 4.0
 
     monkeypatch.setattr(app_module, "HAS_CURL_CFFI", False)
     monkeypatch.setattr(app_module.httpx, "Client", Client)
     monkeypatch.setattr(app_module, "ffmpeg_bin", lambda: "offline-ffmpeg")
-    monkeypatch.setattr(app_module, "_decode_probe_ok", decode)
-    assert app_module._head_probe_sync("https://cdn.example/a.flac", {}) is (status == 206 and not fail_read)
+    monkeypatch.setattr(app_module, "_decode_probe_seconds", decode_seconds)
+    _ok = (status == 206 and not fail_read)
+    assert app_module._head_probe_sync("https://cdn.example/a.flac", {}) == (_ok, (4.0 if _ok else None), _ok)
     assert state["response_closed"] and state["client_closed"]
     assert state["decoded"] is (status == 206 and not fail_read)
 

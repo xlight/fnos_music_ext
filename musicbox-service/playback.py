@@ -248,6 +248,15 @@ async def _resolve(song_id: int, quality: str, generation: int,
             raise UpstreamError("login state changed")
         if item.get("code") not in (200, 404):
             raise UpstreamError("invalid playback status")
+        # 上游字段判试听（change D7）：freeTrialInfo 明示本次只给试听片段
+        # （未登录账号取 VIP 歌的典型形态：code=200 + url 非空 + 30s 试听）。
+        # 试听段不是可播放的全曲——判成不可播（404 形状），让代理侧走跨源回退，
+        # 而不是把 30s 片段当全曲交付（用户听到的是"歌突然结束"）。
+        # 字段权威：只读本次响应里已有的字段，不新增任何网络请求。
+        if item.get("code") == 200 and item.get("freeTrialInfo"):
+            logger.info("playback trial rejected song=%s quality=%s purpose=%s",
+                        song_id, quality, purpose)
+            item = {**item, "code": 404, "url": None, "trial_rejected": True}
         if item.get("url") and not str(item["url"]).startswith(("http://", "https://")):
             raise UpstreamError("invalid playback URL")
         try:

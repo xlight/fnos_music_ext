@@ -499,7 +499,7 @@ def test_failed_refresh_does_not_redirect_to_expired_url(clean_state, monkeypatc
     song = _FakeSong(1, "KuwoMusicClient")
     app_module._cache_put(search_core.normalize(song, "old"), "old", {}, "")
     app_module._SONG_CACHE["kuwo:1"]["ts"] = 0
-    monkeypatch.setattr(app_module, "_head_probe_sync", lambda *args: False)
+    monkeypatch.setattr(app_module, "_head_probe_sync", lambda *args: (False, None, False))
     calls = []
     def fake(*args):
         calls.append(args)
@@ -856,7 +856,7 @@ def test_head_probe_sync_without_ffmpeg_passes_if_bytes_received(monkeypatch):
             pass
 
     monkeypatch.setattr(app_module.httpx, "Client", _Client)
-    assert app_module._head_probe_sync("http://fake.stream/test.flac", {}) is True
+    assert app_module._head_probe_sync("http://fake.stream/test.flac", {}) == (True, None, True)
 
 
 def test_head_probe_sync_returns_false_when_stream_fetch_empty(monkeypatch):
@@ -887,7 +887,7 @@ def test_head_probe_sync_returns_false_when_stream_fetch_empty(monkeypatch):
             pass
 
     monkeypatch.setattr(app_module.httpx, "Client", _Client)
-    assert app_module._head_probe_sync("http://fake.stream/test.flac", {}) is False
+    assert app_module._head_probe_sync("http://fake.stream/test.flac", {}) == (False, None, False)
 
 
 @pytest.mark.anyio
@@ -895,7 +895,7 @@ async def test_maybe_downgrade_swaps_corrupt_lossless_to_mp3(clean_state, monkey
     entry = {"item": {"ext": "flac", "download_url": "http://src/flac"},
              "download_headers": {"User-Agent": "x"}}
     async def _probe_bad(url, headers, song_id):
-        return False
+        return False, None, False
     monkeypatch.setattr(app_module, "_head_probe", _probe_bad)
     monkeypatch.setattr(app_module, "_kuwo_force_mp3_url_sync",
                         lambda sid: ("http://src/mp3", {"User-Agent": "okhttp/3.10.0"}))
@@ -909,7 +909,7 @@ async def test_maybe_downgrade_swaps_corrupt_lossless_to_mp3(clean_state, monkey
 async def test_maybe_downgrade_keeps_clean_lossless(clean_state, monkeypatch):
     entry = {"item": {"ext": "flac"}, "download_headers": {"Referer": "r"}}
     async def _probe_ok(url, headers, song_id):
-        return True
+        return True, None, False
     monkeypatch.setattr(app_module, "_head_probe", _probe_ok)
     url, headers = await app_module._maybe_downgrade(
         "kuwo:123", entry, "http://src/flac", "", "bytes=0-99")
@@ -1015,3 +1015,345 @@ def test_grace_skipped_source_is_not_breaker_failure(clean_state, monkeypatch):
         assert app_module.SOURCE_BREAKER._failures.get("MiguMusicClient", 0) == 0
         assert "MiguMusicClient" not in app_module.ADAPTIVE.stats()
     asyncio.run(main())
+
+
+def test_search_grace_override_waits_for_slow_source(clean_state, monkeypatch):
+    """grace_s 覆盖：宽限更长时慢源的结果也进得来（回退搜索需要慢源）。
+
+    CT201 实测：默认 2s 宽限在 11 源配置下只等得到第一个响应源，回退只拿到
+    1 条 120s 试听；同名全长版在 Kuwo/咪咕（7-10s 才交结果）。
+    """
+    class Boundary:
+        async def run(self, source, payload, **kwargs):
+            if source == "MiguMusicClient":
+                await asyncio.sleep(0.3)
+            kwargs["on_entry"]([search_core.normalize(_FakeSong(1, source), "keyword"), {}, ""])
+            return {"partial": False}
+    monkeypatch.setattr(app_module, "SOURCE_WORKERS", Boundary())
+    monkeypatch.setitem(app_module.CONF, "slow_grace_s", .01)
+    monkeypatch.setitem(app_module.CONF, "fast_return_items", 99)
+
+    async def main():
+        # 默认宽限：慢源来不及交
+        short = await app_module.search(keyword="grace-short", limit=1, sources="kuwo,migu")
+        assert "MiguMusicClient" in short["errors"]
+        # 宽限覆盖：慢源也进得来
+        long = await app_module.search(keyword="grace-long", limit=1, sources="kuwo,migu",
+                                       grace_s=5.0)
+        assert "MiguMusicClient" not in long["errors"]
+        assert len(long["items"]) >= 2
+    asyncio.run(main())
+
+
+# =========================================================================
+# 5A.5 Apple 源级排除（无凭证 → 整源只交付 30-90s 预览）
+# =========================================================================
+def test_apple_source_excluded_without_credentials(clean_state, monkeypatch):
+    """Apple 整源排除：不起 worker、不出结果、不记熔断；env 不再是逃生口。"""
+    monkeypatch.delenv("MUSICDL_APPLE_MEDIA_USER_TOKEN", raising=False)
+    monkeypatch.delenv("MUSICDL_APPLE_USE_WRAPPER", raising=False)
+    monkeypatch.setitem(app_module.CONF, "sources", ["KuwoMusicClient", "AppleMusicClient"])
+    names = dict(app_module.SOURCE_NAMES)
+    names["applemusicclient"] = "AppleMusicClient"
+    names["apple"] = "AppleMusicClient"
+    monkeypatch.setattr(app_module, "SOURCE_NAMES", names)
+    workers = SourceBulkhead(sorted(set(names.values())), spawn=_mock_spawn)
+    monkeypatch.setattr(app_module, "SOURCE_WORKERS", workers)
+
+    calls: dict = {}
+    monkeypatch.setattr(
+        search_core,
+        "search_one_source",
+        _fake_search_factory(calls, {
+            "KuwoMusicClient": {"count": 1, "start": 1},
+            "AppleMusicClient": {"count": 1, "start": 900},
+        }),
+    )
+    try:
+        # 同一个 TestClient 生命周期内跑两次：退出上下文会关闭 SOURCE_WORKERS
+        with TestClient(app_module.app) as client:
+            resp = client.get("/search", params={"keyword": "晴天", "limit": 5,
+                                                 "sources": "kuwo,apple"})
+            assert resp.status_code == 200
+            data = resp.json()
+            # 源列表仍含 AppleMusicClient（配置层没动），但 worker 根本没启动
+            assert "AppleMusicClient" not in calls
+            assert all(not item["id"].startswith("apple:") for item in data["items"])
+            # 空结果语义：不记熔断失败、不压自适应预算
+            assert not app_module.SOURCE_BREAKER.is_open("AppleMusicClient")
+            assert app_module.SOURCE_BREAKER._failures.get("AppleMusicClient", 0) == 0
+            assert "AppleMusicClient" not in app_module.ADAPTIVE.stats()
+
+            # 5A.7：env 不再是逃生口——musicdl 的 Apple VIP 路径只产出受保护的
+            # DownloadItem（不可交付），配了 token 也拿不到全曲直链，Apple 仍排除。
+            app_module.SEARCH_CACHE.clear()
+            monkeypatch.setenv("MUSICDL_APPLE_MEDIA_USER_TOKEN", "media-user-token")
+            resp = client.get("/search", params={"keyword": "晴天2", "limit": 5,
+                                                 "sources": "kuwo,apple"})
+            assert resp.status_code == 200
+            assert calls.get("AppleMusicClient") is None
+            assert all(not item["id"].startswith("apple:") for item in resp.json()["items"])
+    finally:
+        workers.shutdown(wait=True)
+
+
+def test_apple_only_search_reports_skipped_not_breaker(clean_state, monkeypatch):
+    """5A.8：只请求 Apple 时不得谎报熔断——errors 用 "skipped " 前缀。
+
+    proxy 侧会把非空 errors 判成硬失败（不缓存、对外报源失败），
+    而 preview-only 排除按 spec 不算源失败。
+    """
+    monkeypatch.setitem(app_module.CONF, "sources", ["AppleMusicClient"])
+    names = dict(app_module.SOURCE_NAMES)
+    names["applemusicclient"] = "AppleMusicClient"
+    names["apple"] = "AppleMusicClient"
+    monkeypatch.setattr(app_module, "SOURCE_NAMES", names)
+    workers = SourceBulkhead(sorted(set(names.values())), spawn=_mock_spawn)
+    monkeypatch.setattr(app_module, "SOURCE_WORKERS", workers)
+    calls: dict = {}
+    monkeypatch.setattr(
+        search_core,
+        "search_one_source",
+        _fake_search_factory(calls, {"AppleMusicClient": {"count": 1, "start": 900}}),
+    )
+    try:
+        with TestClient(app_module.app) as client:
+            resp = client.get("/search", params={"keyword": "晴天3", "limit": 5,
+                                                 "sources": "apple"})
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["items"] == []
+            assert data["errors"]["AppleMusicClient"].startswith("skipped ")
+            assert calls.get("AppleMusicClient") is None
+            # 不记熔断失败
+            assert not app_module.SOURCE_BREAKER.is_open("AppleMusicClient")
+            assert app_module.SOURCE_BREAKER._failures.get("AppleMusicClient", 0) == 0
+    finally:
+        workers.shutdown(wait=True)
+
+
+def test_apple_excluded_source_not_reported_as_breaker_in_mixed_search(clean_state, monkeypatch):
+    """5A.8：多源搜索里被 preview-only 排除的源同样不得谎报熔断。
+
+    多源路径的 errors 来自「不在 active_src_list」的兜底分支（app.py:919），
+    该分支曾复用 "circuit breaker open" 措辞 → proxy 判 hard failure。
+    """
+    monkeypatch.setitem(app_module.CONF, "sources", ["KuwoMusicClient", "AppleMusicClient"])
+    names = dict(app_module.SOURCE_NAMES)
+    names["applemusicclient"] = "AppleMusicClient"
+    names["apple"] = "AppleMusicClient"
+    monkeypatch.setattr(app_module, "SOURCE_NAMES", names)
+    workers = SourceBulkhead(sorted(set(names.values())), spawn=_mock_spawn)
+    monkeypatch.setattr(app_module, "SOURCE_WORKERS", workers)
+    calls: dict = {}
+    monkeypatch.setattr(
+        search_core,
+        "search_one_source",
+        _fake_search_factory(calls, {"KuwoMusicClient": {"count": 1, "start": 1}}),
+    )
+    try:
+        with TestClient(app_module.app) as client:
+            resp = client.get("/search", params={"keyword": "晴天5", "limit": 5,
+                                                 "sources": "kuwo,apple"})
+            assert resp.status_code == 200
+            data = resp.json()
+            assert calls.get("AppleMusicClient") is None
+            assert data["errors"].get("AppleMusicClient", "").startswith("skipped ")
+            assert data["errors"].get("AppleMusicClient") != "circuit breaker open"
+    finally:
+        workers.shutdown(wait=True)
+
+
+def test_cached_preview_only_items_are_not_returned(clean_state, monkeypatch):
+    """5A.9：源级排除必须覆盖缓存命中——排除前缓存的 Apple 条目不得再返回。"""
+    monkeypatch.setitem(app_module.CONF, "sources", ["KuwoMusicClient", "AppleMusicClient"])
+    names = dict(app_module.SOURCE_NAMES)
+    names["applemusicclient"] = "AppleMusicClient"
+    names["apple"] = "AppleMusicClient"
+    monkeypatch.setattr(app_module, "SOURCE_NAMES", names)
+    workers = SourceBulkhead(sorted(set(names.values())), spawn=_mock_spawn)
+    monkeypatch.setattr(app_module, "SOURCE_WORKERS", workers)
+    calls: dict = {}
+    monkeypatch.setattr(
+        search_core,
+        "search_one_source",
+        _fake_search_factory(calls, {"KuwoMusicClient": {"count": 1, "start": 1}}),
+    )
+    # 预置一条"排除生效前"的 Apple 缓存条目
+    apple_item = {"id": "apple:1721464906", "source": "apple", "title": "晴天",
+                  "artist": "周杰伦", "duration_s": 269.0, "ext": "m4a",
+                  "download_url": "http://src.test/preview.m4a", "file_size": 1024}
+    kuwo_item = {"id": "kuwo:1", "source": "kuwo", "title": "晴天",
+                 "artist": "周杰伦", "duration_s": 269.0, "ext": "flac",
+                 "download_url": "http://src.test/full.flac", "file_size": 2048}
+    app_module.SEARCH_CACHE.put("晴天4", "AppleMusicClient,KuwoMusicClient|limit=5",
+                                 [apple_item, kuwo_item])
+    app_module._cache_put(apple_item, "晴天4", {}, "")
+    app_module._cache_put(kuwo_item, "晴天4", {}, "")
+    try:
+        with TestClient(app_module.app) as client:
+            resp = client.get("/search", params={"keyword": "晴天4", "limit": 5,
+                                                 "sources": "kuwo,apple"})
+            assert resp.status_code == 200
+            data = resp.json()
+            assert all(not item["id"].startswith("apple:") for item in data["items"])
+            assert any(item["id"] == "kuwo:1" for item in data["items"])
+    finally:
+        workers.shutdown(wait=True)
+
+
+# =========================================================================
+# 5C.5-5C.7 运行时试听守卫（复用同一次探测，零额外 I/O）
+# =========================================================================
+def _cache_flac(song_id: str = "kuwo:1", duration_s: float = 269.0) -> dict:
+    item = {
+        "id": song_id, "source": "kuwo", "title": "晴天", "artist": "周杰伦",
+        "album": "叶惠美", "duration_s": duration_s, "ext": "flac",
+        "download_url": "http://src.test/preview.m4a", "file_size": 1024,
+    }
+    app_module._cache_put(item, "晴天", {"User-Agent": "x"}, "")
+    return item
+
+
+class _ProbeResponse:
+    status_code = 206
+
+    def __init__(self, total: int = 1024):
+        self.total = total
+        self.headers = {"content-length": str(total),
+                        "content-range": f"bytes 0-{total - 1}/{total}"}
+
+    def iter_bytes(self, chunk_size):
+        size = min(self.total, app_module._PROBE_BYTES)
+        yield b"fLaC" + b"\x00" * max(0, size - 4)
+
+    def close(self):
+        pass
+
+
+def _install_probe_client(monkeypatch, downloads: list, total: int = 1024) -> None:
+    class _Request:
+        def __init__(self, url):
+            self.url = url
+
+    class _Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def build_request(self, method, url, headers=None):
+            return _Request(url)
+
+        def send(self, request, stream=False):
+            downloads.append(request.url)
+            return _ProbeResponse(total)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(app_module, "HAS_CURL_CFFI", False)
+    monkeypatch.setattr(app_module.httpx, "Client", _Client)
+
+
+def _stream_call(**kwargs):
+    """直接调用 /stream 协程：避免 TestClient 与 httpx.Client 替身互相干扰。"""
+    return asyncio.run(app_module.stream(id=kwargs.pop("id", "kuwo:1"), proxy=False,
+                                         quality="", range_header=None, **kwargs))
+
+
+def test_preview_guard_reuses_single_probe_without_extra_io(clean_state, monkeypatch):
+    """5C.5 预览判定复用同一次探测：下载轮次与 ffmpeg 轮次都只有一次。"""
+    app_module._PROBE_CACHE.clear()
+    downloads: list = []
+    ffmpeg_calls: list = []
+    _install_probe_client(monkeypatch, downloads)
+
+    def _decode_seconds(path):
+        ffmpeg_calls.append(path)
+        return 90.0
+
+    monkeypatch.setattr(app_module, "ffmpeg_bin", lambda: "fake-ffmpeg")
+    monkeypatch.setattr(app_module, "_decode_probe_seconds", _decode_seconds)
+    _cache_flac()
+
+    with pytest.raises(app_module.HTTPException) as err:
+        _stream_call()
+
+    assert err.value.status_code == 404
+    assert len(downloads) == 1
+    assert len(ffmpeg_calls) == 1
+
+
+def test_preview_stream_rejected_not_downgraded(clean_state, monkeypatch):
+    """5C.6 90s 预览（元数据声称 269s）→ 404，绝不降级成 mp3 继续播。"""
+    app_module._PROBE_CACHE.clear()
+    downloads: list = []
+    ffmpeg_calls: list = []
+    _install_probe_client(monkeypatch, downloads)
+
+    def _decode_seconds(path):
+        ffmpeg_calls.append(path)
+        return 90.0
+
+    forced: list = []
+    monkeypatch.setattr(app_module, "ffmpeg_bin", lambda: "fake-ffmpeg")
+    monkeypatch.setattr(app_module, "_decode_probe_seconds", _decode_seconds)
+    monkeypatch.setattr(app_module, "_kuwo_force_mp3_url_sync",
+                        lambda sid: forced.append(sid) or ("http://src.test/mp3", {}))
+    _cache_flac()
+
+    with pytest.raises(app_module.HTTPException) as err:
+        _stream_call()
+
+    assert err.value.status_code == 404
+    assert "preview stream" in str(err.value.detail)
+    assert forced == []          # 没有走 mp3 降级分支
+
+
+def test_preview_guard_passes_through_without_ffmpeg(clean_state, monkeypatch):
+    """5C.7 无 ffmpeg → seconds=None → 放行（退化到源级排除兜底）。"""
+    app_module._PROBE_CACHE.clear()
+    downloads: list = []
+    _install_probe_client(monkeypatch, downloads)
+    monkeypatch.setattr(app_module, "ffmpeg_bin", lambda: None)
+    _cache_flac()
+
+    resp = _stream_call()
+
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "http://src.test/preview.m4a"
+
+
+def test_preview_guard_keeps_full_lossless_stream(clean_state, monkeypatch):
+    """整文件都读到、真实时长与元数据一致 → 放行（不能误杀真无损）。"""
+    app_module._PROBE_CACHE.clear()
+    downloads: list = []
+    _install_probe_client(monkeypatch, downloads, total=1024)
+
+    def _decode_seconds(path):
+        return 269.0
+
+    monkeypatch.setattr(app_module, "ffmpeg_bin", lambda: "fake-ffmpeg")
+    monkeypatch.setattr(app_module, "_decode_probe_seconds", _decode_seconds)
+    _cache_flac(duration_s=269.0)
+
+    resp = _stream_call()
+
+    assert resp.status_code == 302
+
+
+def test_preview_guard_ignores_prefix_only_probe(clean_state, monkeypatch):
+    """探针只读到前缀（文件大于 3MB）→ 时长是下界，不参与判定。"""
+    app_module._PROBE_CACHE.clear()
+    downloads: list = []
+    _install_probe_client(monkeypatch, downloads, total=40 * 1024 * 1024)
+
+    def _decode_seconds(path):
+        return 30.0
+
+    monkeypatch.setattr(app_module, "ffmpeg_bin", lambda: "fake-ffmpeg")
+    monkeypatch.setattr(app_module, "_decode_probe_seconds", _decode_seconds)
+    _cache_flac(duration_s=269.0)
+
+    resp = _stream_call()
+
+    assert resp.status_code == 302
