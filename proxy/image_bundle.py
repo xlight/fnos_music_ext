@@ -119,9 +119,9 @@ def image_matches(local: dict | None, manifest: dict) -> bool:
         return False
     if local["id"] != manifest["image_id"]:
         return False
-    # containerd 镜像存储（Docker 24+）的 `image inspect` 不返回 RootFS.DiffIds。
-    # 镜像 ID 就是 config JSON（其中含 rootfs.diff_ids）的哈希，ID 相等即已覆盖
-    # 该字段；只有本地能读到 diff_ids 时才额外比对。
+    # image_id 是 config 摘要，相等即蕴含 rootfs 描述一致；diff_ids 仅在
+    # inspect 提供（经典 docker 存储）时作加强校验——containerd image store
+    # 的 inspect 不暴露 RootFS.DiffIds，不能据此判不符。
     local_diffs = list(local.get("diff_ids") or [])
     if local_diffs and local_diffs != list(manifest["rootfs_diff_ids"]):
         return False
