@@ -54,7 +54,6 @@ from proxy.fnlog import (  # noqa: E402
 )
 from proxy import llm_usage  # noqa: E402  # 每日大模型 token 账本（纯 stdlib）
 from proxy import completion_log  # noqa: E402  # 整曲补全记录账本（纯 stdlib）
-from proxy import customplaylists as custompl
 from proxy import publicplaylists as pubpl
 from proxy.quality_policy import (  # noqa: E402
     QUALITY_LEVELS,
