@@ -93,6 +93,41 @@ ensure_proxy_venv_compat_link() {
     log_info "代理 venv 位于持久目录 ${VENV_DIR}，已建立兼容入口 ${link} → ${VENV_DIR}。"
 }
 
+# 运行身份保障（3.0.0 权限模型重构）：
+# 代理不再以 root 常驻，uvicorn worker 以曲库属主身份执行 venv 里的 python。
+# 因此 venv 及其 root 属主祖先目录必须对其他用户可遍历/可读：
+#   - 祖先目录补 o+x（0711），否则非 root 的 worker 连解释器都到不了；
+#   - venv 内补 a+rX（只放宽读/执行，不放宽写）。
+# chmod 只作用于 root 属主的链路，遇到已有 o+x 的目录即停止，不误改共享根目录。
+# 目录可能带 POSIX ACL（fnOS @appdata）：chmod 之外再用 setfacl 同步 other/运行用户
+# 的放行位，避免 ACL 语义与位掩码不一致时被平台重置打回。
+ensure_proxy_venv_access() {
+    [ -x "${VENV_DIR}/bin/python" ] || return 0
+    [ "$(id -u)" = "0" ] || return 0
+    chmod -R a+rX "${VENV_DIR}" 2>/dev/null || log_warn "代理 venv 读权限放宽失败，worker 可能无法启动。"
+    local dir owner mode
+    dir="$(dirname -- "${VENV_DIR}")"
+    while [ -n "${dir}" ] && [ "${dir}" != "/" ] && [ "${dir}" != "${BASE_DIR}" ]; do
+        owner="$(stat -c '%u' -- "${dir}" 2>/dev/null || echo 1)"
+        mode="$(stat -c '%a' -- "${dir}" 2>/dev/null || echo 0)"
+        [ "${owner}" = "0" ] || break
+        mode=$(( 0${mode} ))
+        [ $(( mode & 1 )) -eq 1 ] && break   # 已有 o+x，向上无需再改
+        if [ $(( mode & 0070 )) -eq 0 ]; then
+            chmod 0711 "${dir}" 2>/dev/null || break
+        else
+            # 已有组权限的目录只补 other 遍历位，绝不收窄组/属主权限
+            chmod o+x "${dir}" 2>/dev/null || break
+        fi
+        if command -v setfacl >/dev/null 2>&1; then
+            setfacl -m "o::x" "${dir}" 2>/dev/null || true
+            setfacl -m "u:${FNMUSIC_APP_UID:-1000}:x" "${dir}" 2>/dev/null || true
+        fi
+        log_info "已为运行身份开放目录遍历: ${dir}"
+        dir="$(dirname -- "${dir}")"
+    done
+}
+
 VENV_DIR="$(resolve_proxy_venv_dir)"
 REQ_FILE="${BASE_DIR}/proxy/requirements.txt"
 FNMUSIC_DEPS_REVISION="proxy-20261105-1"
@@ -127,6 +162,8 @@ if ! runtime_python_ok "${VENV_PYTHON}"; then
     log_err "请删除 ${VENV_DIR} 后重跑本脚本重建。"
     exit 1
 fi
+
+ensure_proxy_venv_access
 
 REQ_DIGEST="$(deps_requirements_digest "${REQ_FILE}")"
 if [ "${FNMUSIC_REFRESH_DEPS:-0}" != "1" ] \

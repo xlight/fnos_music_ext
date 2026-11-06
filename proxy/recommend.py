@@ -279,17 +279,23 @@ def music_db_path() -> str:
 
 @contextlib.contextmanager
 def _music_db(db_path: str):
-    """只读打开官方库；降权后的运行身份无 ACL，读取期间临时恢复 root。"""
+    """只读打开官方库；worker 以曲库属主运行，直接读即可。
+
+    失败时把数据库路径带进异常消息：运行身份没有权限或库缺失时，日志/维护接口
+    必须能指出是哪个库，而不是只报 "unable to open database file"。
+    """
     try:
-        from . import musicdb
-    except ImportError:
-        import musicdb
-    with musicdb.privileged_read():
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
-        try:
-            yield con
-        finally:
-            con.close()
+    except sqlite3.Error as exc:
+        raise sqlite3.OperationalError(f"{exc}: database {db_path}") from exc
+    try:
+        yield con
+    except sqlite3.DatabaseError as exc:
+        if str(db_path) in str(exc):
+            raise
+        raise sqlite3.OperationalError(f"{exc}: database {db_path}") from exc
+    finally:
+        con.close()
 
 
 def today_key(now: datetime | None = None) -> str:

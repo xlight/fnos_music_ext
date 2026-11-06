@@ -216,3 +216,16 @@ def test_retention_retries_after_purge_error_and_propagates_cancellation(monkeyp
                 await task
         assert len(calls) == 2
     asyncio.run(run())
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permission bits")
+def test_log_file_created_by_another_identity_is_rotated_aside(tmp_path):
+    """升级前 root 写的 0640 日志：worker 无写权限时保留为 .prev 并新建自己的文件。"""
+    path = tmp_path / "proxy.log"
+    path.write_text("old-root-owned\n", encoding="utf-8")
+    path.chmod(0o400)          # 属主只读：O_WRONLY 打开被拒（模拟旧身份文件）
+    with fnlog._open_log_file(path, "a") as handle:
+        handle.write("new\n")
+    assert path.read_text(encoding="utf-8") == "new\n"
+    assert (tmp_path / "proxy.log.prev").read_text(encoding="utf-8") == "old-root-owned\n"
+    assert path.stat().st_uid == os.geteuid()

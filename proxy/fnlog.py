@@ -95,7 +95,14 @@ def _open_log_file(filename: str | Path, mode: str = "a", encoding: str = "utf-8
     try:
         fd = os.open(filename, flags | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        fd = os.open(filename, flags)
+        try:
+            fd = os.open(filename, flags)
+        except PermissionError:
+            # 文件由旧身份创建（升级前 root 常驻写的 0640）。worker 无写权限时
+            # 保留旧内容为 .prev，再创建属于当前身份的新文件；logs 目录是组可写
+            # 的 setgid 目录，rename 与创建都成立，不必放宽旧文件权限。
+            os.replace(filename, str(filename) + ".prev")
+            fd = os.open(filename, flags | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:

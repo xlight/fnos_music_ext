@@ -449,3 +449,34 @@ BASE_IMAGE=docker.m.daocloud.io/library/python:3.13-slim ./install.sh
 
 v1.2.1 及更早的已知问题（umask 077 检出导致镜像内非 root 用户读不了源码），
 v1.2.2 起已修复。若遇旧镜像残留：`git pull && ./install.sh` 重建即可。
+
+## 9. 运行身份与文件权限（3.0.0 权限模型重构）
+
+代理服务不再以 root 常驻，权限模型分两层：
+
+| 层 | 身份 | 职责 |
+| :--- | :--- | :--- |
+| 接管器 `proxy/takeover.py` | root（systemd unit） | 只需要 socket 接管、发布、还原与 IPC 目录创建；不承载业务 |
+| uvicorn worker | **曲库属主**（主组=容器 APP_GID，补充组=曲库组/repo 组） | 全部业务、落盘、读官方库 |
+
+由此带来的行为变化：
+
+- **官方音乐库直接只读**：worker 以曲库属主身份用 `mode=ro` 打开 `music.db`，
+  不再临时提权。库不可读时明确报「不可读/不可用」并给出路径，不静默返回空列表；
+  若曲库目录被 ACL 锁死，需要调整该目录的授权（不在本扩展的处理范围内）。
+- **落盘属主从创建时正确**：边听边存、歌词、整理目录都以曲库属主身份创建，
+  不再做事后 `chown`。媒体文件 `0640`、目录 `0750`（unit `UMask=0027`）。
+  升级前已存在的 `0600` 文件**不会自动回改**，如需统一可手工执行（示例）：
+  ```bash
+  sudo find /vol1/1000/Music -type f -name '*.flac' -exec chmod 0640 {} +
+  sudo find /vol1/1000/Music -type d -exec chmod 0750 {} +
+  ```
+- **venv 需要运行用户可读**：安装/升级脚本会把 `@appdata/fnmusic-ext`、
+  `@appdata/fnmusic-ext/runtime` 补成 `0711`，并把 `runtime/proxy-venv` 树补成
+  `a+rX`（有 POSIX ACL 时同时 `setfacl` 放行）。手工部署若把 venv 放在 `0700`
+  目录里，worker 会启动失败并在 `takeover` 日志里报出用户与解释器路径。
+- **`.env` 为 `0660`**（属主=安装用户/root，组=容器 GID）：代理与容器内 WebUI
+  都需要原子替换该文件，组外用户不可读。升级后由安装脚本自动收敛；手工部署可执行
+  `chmod 0660 .env && chgrp 1000 .env`。
+- **更换落库目录属主后需要重启**：运行身份在进程启动时确定，热重载只更新配置。
+  管理台概览的「运行身份与落库目录」卡片会在 `owner_match=false` 时提示重启。

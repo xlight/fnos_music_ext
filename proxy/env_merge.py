@@ -8,7 +8,7 @@ install.sh 在写入 .env 前先收集“本次安装期望的配置”，再调
 - 新版本引入的新配置项 / 缺失配置项自动安全补齐；
 - 用户手工添加的自定义键原样保留；
 - 用户手写的注释/非赋值行按原顺序去重后保留在文件末尾（合并多次不堆积）；
-- 合并结果原子写入并保持 0640 权限及已有共享组，合并前由调用方负责备份。
+- 合并结果原子写入并保持 0660 权限及已有共享组，合并前由调用方负责备份。
 
 CLI:
     python3 proxy/env_merge.py --existing .env --desired desired.env \
@@ -285,7 +285,7 @@ def preserve_user_comments(
     return out
 
 
-def write_env_atomic(path: str | Path, content: str, mode: int = 0o640) -> None:
+def write_env_atomic(path: str | Path, content: str, mode: int = 0o660) -> None:
     path = Path(path)
     try:
         existing = path.stat()
@@ -303,6 +303,8 @@ def write_env_atomic(path: str | Path, content: str, mode: int = 0o640) -> None:
                 elif os.fstat(f.fileno()).st_gid != existing.st_gid:
                     os.fchown(f.fileno(), -1, existing.st_gid)
             if hasattr(os, "fchmod"):
+                # 0660：代理（曲库属主/APP_GID）与容器 WebUI（appuser/APP_GID）
+                # 都能原子替换；组外用户不可读，密钥不外泄。
                 os.fchmod(f.fileno(), mode)
         os.replace(tmp_name, str(path))
     finally:

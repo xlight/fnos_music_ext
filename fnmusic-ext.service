@@ -16,7 +16,7 @@ TimeoutStopSec=20
 KillMode=mixed
 Restart=on-failure
 RestartSec=5
-UMask=0077
+UMask=0027
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

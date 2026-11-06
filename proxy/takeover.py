@@ -11,6 +11,10 @@ except ImportError:
 import json
 import os
 from pathlib import Path
+try:
+    import pwd
+except ImportError:  # Windows dev hosts have no passwd database
+    pwd = None
 import signal
 import re
 import threading
@@ -373,7 +377,15 @@ class State:
             raise Unsafe('legacy proxy identity unverifiable; refuse stop')
         return 'proxy-recovery'
 
+    def remove_runtime_status(self):
+        """Drop the worker-written status file; a stopped worker has no status."""
+        try:
+            (self.directory / 'ipc' / 'runtime.json').unlink()
+        except OSError:
+            pass
+
     def restore(self):
+        self.remove_runtime_status()
         with self.lock():
             data = self.load()
             t, u = snapshot(self.target), snapshot(self.upstream)
@@ -593,6 +605,125 @@ def drain_diagnostics(pipe, secrets=()):
     pipe.close()
 
 
+# 容器镜像固定的 appuser（Dockerfile），仅在没有更具体属主信息时兜底。
+APP_UID_FALLBACK = 1000
+APP_GID_FALLBACK = 1000
+
+
+def _owner_of(path):
+    # 跟随符号链接：配置的曲库/缓存路径常是指向真实卷的链接，属主以目标为准。
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        return None
+    return st.st_uid, st.st_gid
+
+
+def resolve_runtime_identity(base: Path, env):
+    """决定 worker 的运行身份：曲库属主 + 容器应用组。
+
+    代理不再以 root 常驻：worker 以曲库属主身份运行，这样新建的音乐文件从
+    创建时就是正确属主（不需要事后 chown），官方库也直接以运行身份只读。
+    候选顺序（取第一个非 root 属主）：
+      1. 已配置的落库目录 FNMUSIC_TEE_SAVE_DIR
+      2. 官方曲库目录 FNMUSIC_LIBRARY_DIR
+      3. 缓存目录 FNMUSIC_CACHE_DIR
+      4. 安装器创建的 sources-data（chown 给容器 appuser）
+      5. .env 属主（WebUI 以 appuser 原子写入）
+    主组取 .env/sources-data 的组（容器 APP_GID），补充组加入曲库组与 repo
+    组，保证 worker 既能写 .env/仓库目录，也能写曲库。
+
+    返回 (uid, gid, extra_groups)；非 root/POSIX 环境返回 None（无需也没有
+    权限切换，保持原身份启动）。
+    """
+    if os.name != 'posix' or not hasattr(os, 'geteuid') or os.geteuid() != 0:
+        return None
+    primary_uid = None
+    library_gid = None
+    for key in ('FNMUSIC_TEE_SAVE_DIR', 'FNMUSIC_LIBRARY_DIR', 'FNMUSIC_CACHE_DIR'):
+        value = str(env.get(key) or '').strip()
+        if not value:
+            continue
+        owner = _owner_of(value)
+        if owner and owner[0] != 0:
+            primary_uid, library_gid = owner
+            break
+    source_data = _owner_of(base / 'sources-data')
+    env_file = _owner_of(base / '.env')
+    if primary_uid is None:
+        for candidate in (source_data, env_file):
+            if candidate and candidate[0] != 0:
+                primary_uid, library_gid = candidate
+                break
+    if primary_uid is None:
+        primary_uid = APP_UID_FALLBACK
+    app_gid = None
+    for candidate in (env_file, source_data):
+        if candidate:
+            app_gid = candidate[1]
+            break
+    if app_gid is None:
+        app_gid = base.stat().st_gid if base.exists() else APP_GID_FALLBACK
+    if library_gid is None:
+        library_gid = APP_GID_FALLBACK
+    repo_gid = base.stat().st_gid if base.exists() else app_gid
+    extra = sorted({g for g in (library_gid, repo_gid) if g and g != app_gid})
+    return primary_uid, app_gid, extra
+
+
+def run_as_identity(identity):
+    """subprocess 的降权关键字；identity 为 None 时保持当前身份。"""
+    if not identity:
+        return {}
+    uid, gid, extra_groups = identity
+    return {'user': uid, 'group': gid, 'extra_groups': list(extra_groups)}
+
+
+def describe_identity(identity) -> str:
+    if not identity:
+        return 'current user (no privilege switch)'
+    uid, gid, extra_groups = identity
+    name = str(uid)
+    if pwd is not None:
+        try:
+            name = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            pass
+    return f'{name} (uid={uid} gid={gid} extra_groups={extra_groups})'
+
+
+def ensure_runtime_layout(state, identity):
+    """运行目录 root 0711 + worker 专属 ipc/ 0711。
+
+    takeover.State 要求状态目录属主为 root 且无组/其他写位，因此顶层目录不能
+    chown；容器只需遍历权限。worker 需要写 maintenance socket 与 runtime 状态
+    文件，单开一个属主为 worker、同样无写位的 ipc/ 子目录。
+    """
+    directory = state.directory
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = directory.lstat()
+    if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid()
+            or st.st_mode & 0o022):
+        raise Unsafe('unsafe state directory')
+    os.chmod(directory, 0o711)
+    ipc = directory / 'ipc'
+    ipc.mkdir(mode=0o700, exist_ok=True)
+    uid, gid = ((identity[0], identity[1]) if identity
+                else (os.geteuid(), os.stat(directory).st_gid))
+    if hasattr(os, 'chown'):
+        try:
+            os.chown(ipc, uid, gid)
+        except OSError as exc:
+            if identity:
+                raise Unsafe(f'cannot hand ipc directory to worker identity: {exc.strerror}') from exc
+    os.chmod(ipc, 0o711)
+    st = ipc.lstat()
+    if not stat.S_ISDIR(st.st_mode) or st.st_mode & 0o022:
+        raise Unsafe('unsafe ipc directory')
+
+
 def venv_python(base: Path) -> Path:
     """repo/.venv-proxy 可能是指向持久目录（如 @appdata）的符号链接。
 
@@ -606,10 +737,14 @@ def venv_python(base: Path) -> Path:
         return link / 'bin/python'
 
 
-def preflight(base, env):
+def preflight(base, env, identity=None):
     python = venv_python(base)
     # Imports may create storage directories; all known storage locations go to temp.
+    # The probe runs as the real worker identity so a venv/library the service
+    # cannot reach fails here instead of after the socket was taken over.
     with tempfile.TemporaryDirectory(prefix='fnmusic-preflight-') as temp:
+        if identity:
+            os.chown(temp, identity[0], identity[1])
         isolated = env.copy()
         for key in ('HOME', 'FNMUSIC_HOME', 'FNMUSIC_CACHE_DIR', 'FNMUSIC_FAV_DIR',
                     'FNMUSIC_PLAY_HISTORY_DIR', 'FNMUSIC_RECOMMEND_DIR', 'FNMUSIC_LIBRARY_DIR',
@@ -620,14 +755,21 @@ def preflight(base, env):
         isolated['FNMUSIC_UPSTREAM_SOCK'] = temp + '/nonexistent.socket'
         for command in ([str(python), '-m', 'uvicorn', '--version'],
                         [str(python), '-B', '-c', 'import app; import recommend; assert callable(app.app)']):
+            stage = 'uvicorn module' if '-m' in command else 'app/recommend imports'
             with tempfile.TemporaryFile() as errors:
-                result = subprocess.run(command, cwd=base / 'proxy', env=isolated,
-                                        stdout=subprocess.DEVNULL, stderr=errors, timeout=20)
+                try:
+                    result = subprocess.run(command, cwd=base / 'proxy', env=isolated,
+                                            stdout=subprocess.DEVNULL, stderr=errors, timeout=20,
+                                            **run_as_identity(identity))
+                except OSError as exc:
+                    # EACCES/ENOENT 说明运行身份到不了解释器：报出用户与路径。
+                    raise Unsafe(
+                        f'preflight {stage}: cannot execute {python} as '
+                        f'{describe_identity(identity)}: {exc.strerror}') from exc
                 if result.returncode:
                     size = errors.tell()
                     errors.seek(max(0, size-16384))
                     kind = diagnostic(errors.read().decode('utf-8', 'replace'))
-                    stage = 'uvicorn module' if '-m' in command else 'app/recommend imports'
                     raise Unsafe(f'preflight {stage}: exit={result.returncode}, exception={kind} (values suppressed)')
 
 
@@ -652,7 +794,22 @@ def wait_official_target(state, budget):
 def supervise(state, base):
     env = environment(base)
     env['FNMUSIC_UPSTREAM_SOCK'] = str(state.upstream)
-    preflight(base, env)
+    runtime_identity = resolve_runtime_identity(base, env)
+    if runtime_identity:
+        home = str(base)
+        if pwd is not None:
+            try:
+                account = pwd.getpwuid(runtime_identity[0])
+                home = account.pw_dir if os.path.isdir(account.pw_dir) else str(base)
+                env['USER'] = account.pw_name
+                env['LOGNAME'] = account.pw_name
+            except KeyError:
+                pass
+        # HOME is looked up by libraries even though FNMUSIC_HOME is authoritative.
+        env['HOME'] = home
+    print('[takeover] worker identity: ' + describe_identity(runtime_identity), flush=True)
+    preflight(base, env, runtime_identity)
+    ensure_runtime_layout(state, runtime_identity)
     child = None
     log_thread = None
     changed = False
@@ -667,6 +824,11 @@ def supervise(state, base):
     signal.signal(signal.SIGINT, stop)
     # Private staging prevents uvicorn from unlinking an existing target on startup.
     with tempfile.TemporaryDirectory(prefix='proxy-', dir=state.directory) as temp:
+        if runtime_identity:
+            # The worker binds the staged socket: the private staging dir must
+            # belong to it, otherwise uvicorn dies with EACCES before publish.
+            os.chown(temp, runtime_identity[0], runtime_identity[1])
+            os.chmod(temp, 0o700)
         staged = Path(temp) / 'listen.sock'
         failure = None
         try:
@@ -678,7 +840,8 @@ def supervise(state, base):
                 child = subprocess.Popen([str(venv_python(base)), '-m', 'uvicorn',
                                           'app:app', '--app-dir', str(base / 'proxy'), '--uds', str(staged),
                                           '--no-access-log'], cwd=base / 'proxy', env=env,
-                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                         **run_as_identity(runtime_identity))
                 secrets = tuple(v for k, v in env.items() if v and re.search(r'key|token|secret|password|cookie', k, re.I))
                 log_thread = threading.Thread(target=drain_diagnostics, args=(child.stdout, secrets), daemon=True)
                 log_thread.start()

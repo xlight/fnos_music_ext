@@ -199,3 +199,14 @@ def test_extend_search_verification_opt_in():
     # 3.0.0+：外网搜索验收默认跳过，只有 FNMUSIC_VERIFY_SEARCH=1 才执行
     assert 'FNMUSIC_VERIFY_SEARCH:-0' in extend
     assert extend.index("验收 6b 跳过") < extend.index("验收 6b: 验证音源搜索连通性")
+
+
+def test_image_matches_without_rootfs_diff_ids(tmp_path):
+    """containerd 镜像存储不返回 DiffIds：ID 相等即视为同一镜像。"""
+    manifest, _ = ib.check(write_bundle(tmp_path))
+    local = matching_local()
+    local["diff_ids"] = []
+    assert ib.image_matches(local, manifest)
+    # ID 不同仍拒绝
+    local["id"] = "sha256:" + "f" * 64
+    assert not ib.image_matches(local, manifest)

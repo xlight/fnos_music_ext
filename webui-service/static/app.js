@@ -610,6 +610,27 @@ function formatVersionLabel(version) {
 }
 
 /* -------------------------------------------------------------- 概览 */
+function renderOverviewRuntime(st) {
+  const card = $("#ov-runtime-card");
+  const box = $("#ov-runtime");
+  const rt = st.runtime || null;
+  if (!rt) {
+    card.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  card.hidden = false;
+  const rows = [];
+  rows.push(`<div class="kv"><b>代理运行身份</b>uid ${escapeHtml(rt.uid ?? "-")}</div>`);
+  rows.push(`<div class="kv"><b>落库目录</b>${escapeHtml(rt.library_dir || "-")}</div>`);
+  if (rt.owner_match === false) {
+    rows.push(`<span class="state-line"><span class="dot err"></span>落库目录属主与当前运行身份不一致：已保存，重启服务后才会以新属主落库。</span>`);
+  } else if (rt.owner_match === true) {
+    rows.push(`<span class="state-line"><span class="dot ok"></span>落库目录属主与运行身份一致</span>`);
+  }
+  box.innerHTML = rows.join("");
+}
+
 async function loadStatus() {
   try {
     const st = await api("/api/status");
@@ -646,6 +667,7 @@ async function loadStatus() {
     renderLxSourceList(); // 只同步运行徽标，不重载配置或丢弃尚未保存的编辑。
     renderLxSourceOrder();
     renderOverviewCompletion(st);   // 概览页「最近补全」卡片（数据来自 /api/status 的 completion 摘要）
+    renderOverviewRuntime(st);      // 运行身份与落库目录（宿主机 worker 写的 runtime.json）
     const lxCard = $("#ov-lx-card");
     if (st.current_provider === "lxmusic" && st.lx_source) {
       lxCard.hidden = false;
@@ -1167,11 +1189,19 @@ async function saveConfig() {
       toast((parts.join("；") || "") + ` —— ${failed.map((f) => f.error).join("；")}`, "fail");
     } else {
       const note = completionBudgetNote(values);
-      toast((parts.join("；") || "已保存") + "（代理约 3 秒内热重载生效）" + (note ? `；${note}` : ""), "ok");
+      const identityNote = (result.changed || []).some(
+        (k) => k === "FNMUSIC_TEE_SAVE_DIR" || k === "FNMUSIC_LIBRARY_DIR")
+        ? "；运行身份与落库目录约 4 秒后刷新，属主变化会提示重启服务"
+        : "";
+      toast((parts.join("；") || "已保存") + "（代理约 3 秒内热重载生效）" + identityNote + (note ? `；${note}` : ""), "ok");
     }
     clearDirty();
     try { await loadConfig(); } catch (err) { console.warn("配置加载失败", err); }
     try { await loadStatus(); } catch (err) { console.warn("状态加载失败", err); }
+    if ((result.changed || []).some((k) => k === "FNMUSIC_TEE_SAVE_DIR" || k === "FNMUSIC_LIBRARY_DIR")) {
+      // 热重载约 3 秒后才重写 runtime.json，稍后再取一次运行身份/落库目录。
+      window.setTimeout(() => { loadStatus().catch(() => {}); }, 4000);
+    }
     try { refreshLlmUsage(); } catch (err) { console.warn("LLM用量加载失败", err); }
   } catch (exc) {
     lxRuntimeSnapshot = null;

@@ -2235,7 +2235,7 @@ def test_env_backup_is_private_from_creation(env_file, monkeypatch):
     real_write = webui.write_env_atomic
     calls = []
 
-    def write(path, content, mode=0o640):
+    def write(path, content, mode=0o660):
         calls.append((path, mode))
         return real_write(path, content, mode=mode)
 
@@ -2251,7 +2251,7 @@ def test_env_backup_failure_does_not_block_save(env_file, monkeypatch):
     backup.write_text("old backup", encoding="utf-8")
     real_write = webui.write_env_atomic
 
-    def write(path, content, mode=0o640):
+    def write(path, content, mode=0o660):
         if path == backup:
             raise PermissionError("read-only backup")
         return real_write(path, content, mode=mode)

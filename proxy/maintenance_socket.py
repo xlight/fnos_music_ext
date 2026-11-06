@@ -10,7 +10,7 @@ import socket
 import stat
 from pathlib import Path
 
-DEFAULT_SOCKET = "/run/fnmusic-ext/maintenance.sock"
+DEFAULT_SOCKET = "/run/fnmusic-ext/ipc/maintenance.sock"
 MAX_HEADER = 16 * 1024
 MAX_BODY = 4096
 REQUEST_TIMEOUT = 5
@@ -30,10 +30,19 @@ def _parent(path: Path) -> None:
             raise PermissionError(f"Unsafe directory: {directory}")
         if st.st_mode & 0o022 and not (st.st_uid == 0 and st.st_mode & stat.S_ISVTX):
             raise PermissionError(f"Writable ancestor: {directory}")
+    created = False
     try:
-        path.parent.mkdir(mode=0o700)
+        path.parent.mkdir(mode=0o711)
+        created = True
     except FileExistsError:
         pass
+    if created:
+        # mkdir mode is masked by the service umask (0077); the ipc directory is
+        # intentionally traversable so the container can reach the socket.
+        try:
+            os.chmod(path.parent, 0o711)
+        except OSError:
+            pass
     st = path.parent.lstat()
     if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid()
             or st.st_mode & 0o022):
@@ -216,15 +225,8 @@ async def start(loop, callback, path=DEFAULT_SOCKET):
         # (organize/cleanup/music-users) work even when the fnOS desktop gateway
         # fails to intercept the request.
         os.chmod(path, 0o660)
-        # Chown group to .env's group (APP_GID) so the container's appuser
-        # can connect when the socket is mounted into the container.
-        try:
-            _env = os.environ.get("FNMUSIC_ENV_FILE") or os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-            if os.path.isfile(_env):
-                os.chown(path, 0, os.stat(_env).st_gid)
-        except OSError:
-            pass
+        # Group ownership is inherited from the worker process (primary gid is
+        # APP_GID), so the container's appuser can connect without a chown.
         sock.setblocking(False)
         server = await asyncio.start_unix_server(handle, sock=sock, limit=MAX_HEADER)
     except BaseException:

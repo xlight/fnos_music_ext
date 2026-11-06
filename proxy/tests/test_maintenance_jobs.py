@@ -12,22 +12,37 @@ def anyio_backend():
     return "asyncio"
 
 
-def test_root_owned_library_still_prepares_maintenance_directory(monkeypatch):
-    from types import SimpleNamespace
+def test_runtime_status_reports_worker_identity_and_library(monkeypatch, tmp_path):
+    """worker 把自己的真实 uid 与有效落库目录写给容器 WebUI。"""
+    import json
+    import os
 
-    permissions = []
-    monkeypatch.setattr(runtime, "_posix_euid", lambda: 0)
-    monkeypatch.setattr(runtime, "tee_save_dir", lambda: "/isolated/library")
-    monkeypatch.setitem(runtime.CONF, "cache_dir", "/isolated/cache")
-    fake_os = SimpleNamespace(**vars(runtime.os))
-    fake_os.path = SimpleNamespace(**vars(runtime.os.path))
-    fake_os.makedirs = lambda *args, **kwargs: None
-    fake_os.stat = lambda *args, **kwargs: SimpleNamespace(st_uid=0, st_gid=0)
-    fake_os.path.isdir = lambda path: path == "/run/fnmusic-ext"
-    fake_os.chmod = lambda path, mode: permissions.append((path, mode))
-    monkeypatch.setattr(runtime, "os", fake_os)
-    assert runtime._drop_privileges() == (0, 0)
-    assert permissions == [("/run/fnmusic-ext", 0o711)]
+    library = tmp_path / "library"
+    library.mkdir()
+    monkeypatch.setenv("FNMUSIC_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setitem(runtime.CONF, "tee_save_dir", str(library))
+    runtime.publish_runtime_status()
+    data = json.loads((tmp_path / "runtime.json").read_text(encoding="utf-8"))
+    assert data == {"uid": os.geteuid(), "library_dir": str(library), "owner_match": True}
+    assert (tmp_path / "runtime.json").stat().st_mode & 0o777 == 0o640
+
+
+def test_runtime_status_has_no_owner_warning_for_cache_fallback(monkeypatch, tmp_path):
+    """没有库目录时回退内部缓存，owner_match=null（不能误报“需要重启”）。"""
+    import json
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("FNMUSIC_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setitem(runtime.CONF, "tee_save_dir", "")
+    monkeypatch.setitem(runtime.CONF, "library_dir", "")
+    monkeypatch.setitem(runtime.CONF, "music_db", "")
+    monkeypatch.setitem(runtime.CONF, "cache_dir", str(cache))
+    monkeypatch.setattr(runtime, "_DETECTED_LIBRARY_DIR", "")
+    runtime.publish_runtime_status()
+    data = json.loads((tmp_path / "runtime.json").read_text(encoding="utf-8"))
+    assert data["library_dir"] == str(cache)
+    assert data["owner_match"] is None
 
 
 def test_fs_check_existing_and_missing_directory_leave_no_probe(tmp_path):

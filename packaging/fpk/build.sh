@@ -183,11 +183,48 @@ if [ "${IMAGE_ASSET_MODE}" != "skip" ]; then
             -t fnmusic-sources:latest \
             "${STAGE}/app/repo"
         IMAGE_ID="$(docker image inspect fnmusic-sources:latest --format '{{.Id}}')"
-        DIFF_IDS="$(docker image inspect fnmusic-sources:latest --format '{{json .RootFS.DiffIds}}')"
+        # containerd 存储下该模板会直接报错（无 DiffIds 键），失败时留空走归档回退。
+        DIFF_IDS="$(docker image inspect fnmusic-sources:latest --format '{{json .RootFS.DiffIds}}' 2>/dev/null || true)"
         DOCKERFILE_SHA="$(sha256sum "${STAGE}/app/repo/container/Dockerfile" | awk '{print $1}')"
         ARCHIVE="${BUNDLE_DIR}/fnmusic-sources-image.tar.gz"
         echo "[fpk] docker save | gzip → ${ARCHIVE} ..."
         docker save fnmusic-sources:latest | gzip "-${FPK_IMAGE_GZIP_LEVEL:-6}" > "${ARCHIVE}"
+        if [ -z "${DIFF_IDS}" ] || [ "${DIFF_IDS}" = "null" ]; then
+            # containerd 镜像存储（Docker 24+）不向 image inspect 暴露 .RootFS.DiffIds；
+            # 从刚保存的 archive 内的 config JSON 读取，兼容两种存储后端。
+            DIFF_IDS="$(python3 - "${ARCHIVE}" <<'DIFFIDS'
+import gzip, json, sys, tarfile
+path = sys.argv[1]
+manifest = None
+blobs = {}
+with gzip.open(path, "rb") as raw:
+    with tarfile.open(fileobj=raw, mode="r|") as tar:
+        for member in tar:
+            if not member.isfile() or member.size > 2 * 1024 * 1024:
+                continue
+            name = member.name
+            # 经典格式：<id>.json + manifest.json；containerd 格式：
+            # blobs/sha256/<digest>（config 很小，层数据已被尺寸过滤）。
+            if not (name == "manifest.json" or name.startswith("blobs/")
+                    or ("/" not in name and name.endswith(".json"))):
+                continue
+            data = tar.extractfile(member).read()
+            if name == "manifest.json":
+                manifest = json.loads(data)
+            else:
+                blobs[name] = data
+if not manifest:
+    raise SystemExit("manifest.json missing from image archive")
+name = manifest[0]["Config"]
+short = name.split("/")[-1]
+data = (blobs.get(name) or blobs.get("blobs/sha256/" + short)
+        or blobs.get(short + ".json") or blobs.get(short))
+if data is None:
+    raise SystemExit("config blob missing from image archive")
+print(json.dumps(json.loads(data)["rootfs"]["diff_ids"]))
+DIFFIDS
+)"
+        fi
         ARCHIVE_SHA="$(sha256sum "${ARCHIVE}" | awk '{print $1}')"
         ARCHIVE_BYTES="$(stat -c %s "${ARCHIVE}")"
         python3 - "${BUNDLE_DIR}" "${IMAGE_ARCH}" "${IMAGE_ID}" "${DIFF_IDS}" \

@@ -1656,7 +1656,12 @@ async def _env_watch_loop() -> None:
                 _LIBRARY_FILE_LOCK.release()
             if changed:
                 if "tee_save_dir" in changed or "library_dir" in changed:
-                    _reevaluate_privileges()
+                    # 运行身份在进程启动时确定，热重载只刷新状态文件（属主不匹配时
+                    # WebUI 会提示重启）；library_dir 变化时重新探测缓存。
+                    global _DETECTED_LIBRARY_DIR
+                    if "library_dir" in changed:
+                        _DETECTED_LIBRARY_DIR = ""
+                    publish_runtime_status()
                 _reset_search_cache()
                 _refresh_recommend_config(changed)
                 logger.info(".env 热重载生效: %s", ",".join(sorted(changed)))
@@ -2869,21 +2874,18 @@ def detect_library_dir() -> str:
     db = str(CONF.get("music_db") or "")
     if db:
         try:
-            from . import musicdb
-        except ImportError:
-            import musicdb
-        try:
-            # 配置热重载时已降权，官方库目录仅 root 可读，探测期间临时恢复。
-            with musicdb.privileged_read():
-                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-                try:
-                    rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
-                finally:
-                    con.close()
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
+            finally:
+                con.close()
             for (path,) in rows:
                 if path and os.path.isdir(path):
                     _DETECTED_LIBRARY_DIR = path
                     return path
+        except sqlite3.OperationalError as e:
+            logger.warning(
+                "无法以运行身份只读打开官方库 %s（需能读取该文件及其父目录）: %s", db, e)
         except Exception as e:
             logger.warning("Failed to read shared_library path: %s", e)
     return CONF["cache_dir"]
@@ -2933,158 +2935,70 @@ def _get_repo_root():
 
 _REPO_ROOT = _get_repo_root()
 
-# 进程启动时的身份（root）；成功降权后记录实际运行身份，供配置热重载时回退。
-# Windows 开发机没有 geteuid/getegid（离线测试套件需要可导入），按无特权 (-1) 处理。
-_PRIV_STATE = [os.geteuid() if hasattr(os, "geteuid") else -1,
-               os.getegid() if hasattr(os, "getegid") else -1]
+# runtime 状态文件：worker 以曲库属主身份运行，把真实身份与有效落库目录写给
+# 容器内 WebUI（只读挂载）。目录由 takeover 创建并 chown 给 worker；开发/测试
+# 环境下目录不存在时静默跳过。
+RUNTIME_STATUS_DIR = "/run/fnmusic-ext/ipc"
 
 
-def _posix_euid() -> int:
-    """当前有效 uid；Windows 开发机无 geteuid，返回 -1 表示无权限切换语义。"""
+def _runtime_uid() -> int:
     return os.geteuid() if hasattr(os, "geteuid") else -1
 
 
-def _staged_socket_path():
-    import sys
-    argv = sys.argv
-    for index, arg in enumerate(argv):
-        if arg.startswith('--uds='):
-            return arg.split('=', 1)[1]
-        if arg == '--uds' and index + 1 < len(argv):
-            return argv[index + 1]
-    return ''
+def runtime_status_path() -> str:
+    directory = os.environ.get("FNMUSIC_RUNTIME_DIR") or RUNTIME_STATUS_DIR
+    return os.path.join(directory, "runtime.json")
 
 
-def _drop_privileges(fallback=None):
-    """root-only 初始化完成后降权到曲库属主；失败即退出（fail closed）。
-
-    uvicorn 0.54 在 lifespan 结束后才 bind --uds，因此先由本函数把暂存
-    socket 目录 chown/chmod 给目标用户，再 seteuid，bind 才能成功。
-    """
-    euid = _posix_euid()
-    if euid != 0:
-        return euid, (os.getegid() if hasattr(os, "getegid") else -1)
-    # socket 的0660限制访问者；父目录必须可遍历，即使本次保留root身份。
-    run_dir = '/run/fnmusic-ext'
-    if os.path.isdir(run_dir):
-        try:
-            os.chmod(run_dir, 0o711)
-        except OSError as exc:
-            logger.warning('could not make %s traversable: %s', run_dir, exc)
-    primary_uid = primary_gid = 0
-    for candidate in (tee_save_dir(), str(CONF.get('cache_dir') or '')):
-        if not candidate:
-            continue
-        try:
-            os.makedirs(candidate, exist_ok=True)
-            st = os.stat(candidate)
-            if st.st_uid:
-                primary_uid, primary_gid = st.st_uid, st.st_gid
-                break
-        except OSError:
-            continue
-    if not primary_uid:
-        if fallback and fallback[0]:
-            primary_uid, primary_gid = int(fallback[0]), int(fallback[1])
-            logger.info(
-                'no non-root library owner detected; keeping previous uid=%d gid=%d',
-                primary_uid, primary_gid)
-        else:
-            logger.info('privileges retained: uid=0 gid=0 (no non-root library owner detected)')
-            return 0, 0
-    venv_dir = os.path.join(_REPO_ROOT, '.venv-proxy')
-    if os.path.isdir(venv_dir):
-        try:
-            for root, dirs, files in os.walk(venv_dir):
-                try:
-                    os.chown(root, primary_uid, primary_gid)
-                except OSError:
-                    pass
-                for name in files:
-                    try:
-                        os.chown(os.path.join(root, name), primary_uid, primary_gid)
-                    except OSError:
-                        pass
-        except OSError as exc:
-            logger.warning('could not prepare proxy venv %s: %s', venv_dir, exc)
-    staged = _staged_socket_path()
-    if staged:
-        staged_dir = os.path.dirname(staged)
-        if staged_dir and os.path.isdir(staged_dir):
-            try:
-                os.chown(staged_dir, primary_uid, primary_gid)
-                os.chmod(staged_dir, 0o700)
-            except OSError as exc:
-                logger.warning('could not prepare staged socket directory %s: %s', staged_dir, exc)
-    repo_gid = 0
+def _owner_match(path: str) -> bool | None:
     try:
-        repo_gid = os.stat(_REPO_ROOT).st_gid
+        return os.stat(path).st_uid == _runtime_uid()
     except OSError:
-        repo_gid = 0
-    groups = [primary_gid]
-    if repo_gid and repo_gid not in (0, primary_gid):
-        groups.append(repo_gid)
-    try:
-        os.setgroups(groups)
-    except OSError as exc:
-        logger.warning('could not set supplementary groups %s: %s', groups, exc)
-    try:
-        os.setegid(primary_gid)
-        os.seteuid(primary_uid)
-    except Exception as exc:
-        logger.error('privilege drop failed: %s', exc)
-        raise SystemExit(1)
-    logger.info('privileges dropped to uid=%d gid=%d groups=%s', primary_uid, primary_gid, groups)
-    _PRIV_STATE[0], _PRIV_STATE[1] = primary_uid, primary_gid
-    return primary_uid, primary_gid
+        return None
 
 
-def _reevaluate_privileges():
-    """tee_save_dir/library_dir 变化后重新探测属主并降权。
+def effective_library_dir() -> tuple[str, bool | None]:
+    """返回 (有效落库目录, 属主是否匹配运行身份)。
 
-    以 root 身份重新探测（music.db 可能仅 root 可读）；若新路径属于 root
-    或其他不可用属主，则回退到当前运行身份，绝不永久提权。
+    只有「配置的落库目录」或「探测到的官方曲库」才参与属主比较；两者都不可用
+    时回退到内部缓存目录，owner_match 为 None——缓存目录属主与曲库无关，不能
+    据此提示用户重启服务。
     """
-    if not hasattr(os, "seteuid"):
-        return  # Windows 开发机无权限切换语义，无可重估
-    if os.geteuid() != 0:
-        try:
-            os.setegid(0)
-            os.seteuid(0)
-        except OSError as exc:
-            logger.warning('could not re-raise for config change: %s', exc)
-            return
-    global _DETECTED_LIBRARY_DIR
-    _DETECTED_LIBRARY_DIR = ""
-    try:
-        detect_library_dir()
-    except Exception as exc:  # noqa: BLE001
-        logger.debug('library dir re-detect failed: %s', exc)
-    try:
-        _drop_privileges(tuple(_PRIV_STATE))
-    except SystemExit:
-        raise
+    explicit = str(CONF.get("tee_save_dir") or "").strip()
+    if explicit and os.path.isdir(explicit):
+        return explicit, _owner_match(explicit)
+    detected = detect_library_dir()
+    if str(CONF.get("library_dir") or "").strip() or _DETECTED_LIBRARY_DIR:
+        return detected, _owner_match(detected)
+    return detected, None
 
 
-def _re_raise_and_drop():
-    if not hasattr(os, "seteuid"):
+def publish_runtime_status() -> None:
+    """原子写 runtime.json（0640、组 APP_GID），供容器 WebUI 展示运行态。"""
+    path = runtime_status_path()
+    directory = os.path.dirname(path)
+    if not os.path.isdir(directory):
         return
-    if _posix_euid() == 0:
-        try:
-            _drop_privileges()
-        except SystemExit:
-            raise
-        return
+    library_dir, owner_match = effective_library_dir()
+    payload = {"uid": _runtime_uid(), "library_dir": library_dir,
+               "owner_match": owner_match}
+    name = ""
     try:
-        os.setegid(0)
-        os.seteuid(0)
+        fd, name = tempfile.mkstemp(dir=directory, prefix=".runtime.")
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(payload, out, ensure_ascii=False)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(name, 0o640)
+        os.replace(name, path)
     except OSError as exc:
-        logger.warning('could not re-raise privileges: %s', exc)
-        return
-    try:
-        _drop_privileges()
-    except SystemExit:
-        raise
+        logger.debug("runtime status write failed: %s", exc)
+    finally:
+        if name and os.path.exists(name):
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
 
 
 def find_cache_file(guid: str, *, playback: bool = False) -> str | None:
@@ -5518,24 +5432,20 @@ def list_music_users(db_path: str = "") -> list[dict]:
     if not path:
         raise ValueError(f"飞牛音乐数据库不可用: {path}")
     try:
-        from . import musicdb
-    except ImportError:
-        import musicdb
-    try:
-        # 官方库目录按用户 ACL 授权，降权后的运行身份无法遍历；读取期间临时
-        # 恢复 root 有效身份。exists() 会把权限拒绝误报成文件缺失，故改为在
-        # 提权后打开，由异常区分缺失与权限问题。
-        with musicdb.privileged_read():
-            with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as con:
-                rows = con.execute(
-                    """SELECT guid, name, role
-                         FROM user
-                        WHERE status != 'deleted' AND TRIM(guid) != ''
-                        ORDER BY id"""
-                ).fetchall()
+        # 运行身份即曲库属主，直接只读打开；不改变官方库内容与权限。
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as con:
+            rows = con.execute(
+                """SELECT guid, name, role
+                     FROM user
+                    WHERE status != 'deleted' AND TRIM(guid) != ''
+                    ORDER BY id"""
+            ).fetchall()
     except sqlite3.OperationalError as exc:
         message = str(exc).lower()
         if "unable to open" in message or "not a database" in message:
+            if os.path.exists(path) and not os.access(path, os.R_OK):
+                raise ValueError(
+                    f"飞牛音乐数据库不可读（运行身份需能读取 {path} 及其父目录）") from exc
             raise ValueError(f"飞牛音乐数据库不可用: {path}") from exc
         raise ValueError(f"读取飞牛音乐用户失败: {exc}") from exc
     except sqlite3.Error as exc:
@@ -5843,13 +5753,12 @@ async def lifespan(fastapi_app: FastAPI):
         except OSError as exc:
             logger.warning("Maintenance socket unavailable: %s", exc)
 
-    # root-only 初始化已完成：先以 root 探测曲库目录（music.db 可能仅 root 可读），
-    # 再降权；_drop_privileges 会把暂存 socket 目录交给目标用户，uvicorn 在
-    # lifespan 结束后 bind --uds 才不会 EACCES。
+    # worker 已由 takeover 以曲库属主身份启动：以运行身份探测曲库目录，并把
+    # 运行态写给容器 WebUI。官方库不可读时保留明确告警，不静默回退。
     detect_library_dir()
-    _drop_privileges()
+    publish_runtime_status()
 
-    # 后台任务在降权之后创建，避免首个 await 期间以 root 写用户目录。
+    # 后台任务按运行身份创建。
     if _background_jobs_enabled():
         sweeper_task = asyncio.create_task(_lyric_orphan_sweeper())
         log_task = asyncio.create_task(_log_retention_loop())
@@ -5869,12 +5778,6 @@ async def lifespan(fastapi_app: FastAPI):
     try:
         yield
     finally:
-        if hasattr(os, "seteuid") and os.geteuid() != 0:
-            try:
-                os.setegid(0)
-                os.seteuid(0)
-            except OSError as exc:
-                logger.warning("could not re-raise for shutdown: %s", exc)
         if maintenance_server is not None:
             await maintenance_socket.stop(maintenance_server)
         if _maintenance_task is not None and not _maintenance_task.done():
@@ -11680,8 +11583,18 @@ def _sync_recommend_version_marker() -> None:
         _cancel_daily_tasks()
     try:
         os.makedirs(dailyrec.recommend_cache_dir(), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(ver)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(ver)
+        except PermissionError:
+            # 升级前该标记由 root 创建（0600）；目录对容器组可写，删掉旧文件后
+            # 以运行身份重建，避免每次启动都写入失败。
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(ver)
     except OSError as e:
         logger.warning("failed to write recommend version marker: %s", e)
     if prev:

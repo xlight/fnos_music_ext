@@ -228,7 +228,7 @@ def test_merge_same_version_reinstall_keeps_everything():
 def test_write_env_atomic_permissions_and_content(tmp_path):
     out = tmp_path / ".env"
     env_merge.write_env_atomic(out, env_merge.render_env(DESIRED))
-    assert stat.S_IMODE(out.stat().st_mode) == 0o640
+    assert stat.S_IMODE(out.stat().st_mode) == 0o660
     kv, _ = env_merge.parse_env_file(out)
     assert dict(kv)["FNMUSIC_VERSION"] == "1.1.0"
 
@@ -243,7 +243,7 @@ def test_write_env_atomic_root_preserves_existing_owner(tmp_path, monkeypatch):
     env_merge.write_env_atomic(out, "A='new'\n")
     assert calls == [(owner.st_uid, owner.st_gid)]
     assert out.read_text(encoding="utf-8") == "A='new'\n"
-    assert stat.S_IMODE(out.stat().st_mode) == 0o640
+    assert stat.S_IMODE(out.stat().st_mode) == 0o660
     assert not list(tmp_path.glob(".env.merge.*"))
 
 
@@ -337,7 +337,7 @@ except PermissionError:
 else:
     assert member
 assert p.stat().st_gid == shared
-assert p.stat().st_mode & 0o777 == 0o640
+assert p.stat().st_mode & 0o777 == 0o660
 assert p.read_text() == ("A='new'\\n" if member else "A='old'\\n")
 assert not list(p.parent.glob('.env.merge.*'))
 """
@@ -472,7 +472,7 @@ def test_cli_end_to_end_merge(tmp_path, capsys):
     assert m["FNMUSIC_MY_EXTRA"] == "x"
     assert m["FNMUSIC_CACHE_DIR"] == "/default/home/cache"
     assert m["FNMUSIC_VERSION"] == "1.1.0"
-    assert stat.S_IMODE(existing.stat().st_mode) == 0o640
+    assert stat.S_IMODE(existing.stat().st_mode) == 0o660
     summary = capsys.readouterr().err
     assert "preserved" in summary and "added" in summary
 

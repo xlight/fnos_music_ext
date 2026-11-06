@@ -5,6 +5,29 @@
 
 ## [Unreleased]
 
+### 权限模型重构（代理不再以 root 常驻）
+
+- **BREAKING（内部）**：`proxy/takeover.py` 仍以 root 启动，但只负责 socket 接管/发布/
+  还原与运行目录准备；业务 worker 改由 `Popen(user=曲库属主, group=APP_GID,
+  extra_groups=[曲库组, repo组])` 启动。`app.py` 的 `_drop_privileges` /
+  `_reevaluate_privileges` / `_re_raise_and_drop` 与 `musicdb.py` 的 root 租约
+  （`privileged_read` / `as_service_user`）全部删除，运行期不再 `seteuid/setegid`。
+- 官方音乐库改为运行身份直接 `mode=ro` 读取；缺库与权限拒绝分别报可操作错误，
+  不再以 root 提权兜底。被 ACL 锁死的库环境属于明确 Non-Goal。
+- 新建媒体文件/目录的属主从创建时即曲库属主；unit `UMask` 由 `0077` 调整为
+  `0027`（媒体 `0640`、目录 `0750`）。存量 `0600` 文件不回改。
+- 运行目录拆层：`/run/fnmusic-ext` 保持 root `0711`（`takeover.State` 要求），
+  新增 `/run/fnmusic-ext/ipc`（worker 属主、`0711`）承载维护 socket 与
+  `runtime.json`；维护 socket 路径变为 `/run/fnmusic-ext/ipc/maintenance.sock`。
+- 管理台重载/升级后 `@appdata/fnmusic-ext`、`runtime` 补 `0711`，venv 树补 `a+rX`
+  （有 ACL 时同步 `setfacl`），修复「降权后读不到 venv」导致的网易播放 404。
+- `.env` 模式改为 `0660`（组=容器 GID），代理与 WebUI 双方可原子替换；安装脚本
+  注释与两处 `chmod` 同步，`public_playlists_cache` 纳入 repo 组可写清单。
+- 管理台概览新增「运行身份与落库目录」卡片：读取 `/run/fnmusic-ext/ipc/runtime.json`，
+  落库目录属主与运行身份不一致时提示「重启服务后生效」；无库目录（回退内部缓存）
+  时不提示。
+
+
 
 - 管理台修复：整曲补全提交（3a6a05c）新增 `completionBudgetNote` 时误覆盖了
   `checkActiveConfigJob` 的收尾 `}`，浏览器加载 `app.js` 报

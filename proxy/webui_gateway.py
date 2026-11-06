@@ -42,7 +42,7 @@ HOST_FILE_MAX_BODY = 1 << 20          # 请求体上限 1MB（只装一个路径
 HOST_FILE_MAX_BYTES = 9_000_000       # 与 lxmusic SCRIPT_MAX_BYTES 对齐
 FS_CHECK_PATHS = ("/app/fnmusic-ext/api/fs-check", "/api/fs-check")
 FS_CHECK_MAX_BODY = 1 << 20           # 同 host-file：只装一个路径字符串
-MAINTENANCE_SOCKET = "/run/fnmusic-ext/maintenance.sock"
+MAINTENANCE_SOCKET = "/run/fnmusic-ext/ipc/maintenance.sock"
 MAINTENANCE_ROOT = "/api/maintenance"
 MAINTENANCE_MAX_HEADER = 16 * 1024
 MAINTENANCE_MAX_BODY = 4096
@@ -58,6 +58,12 @@ def socket_path_for(base: Path) -> Path:
         return parent / SOCK_NAME
     run = Path("/run/fnmusic-ext")
     run.mkdir(parents=True, exist_ok=True)
+    # Standalone/manual start must not leave a 0700 dir (service umask 0077):
+    # the container mounts this directory and needs traverse permission.
+    try:
+        run.chmod(0o711)
+    except OSError:
+        pass
     return run / SOCK_NAME
 
 

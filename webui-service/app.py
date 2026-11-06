@@ -82,7 +82,8 @@ CONF = {
 
 ENV_PATH = Path(CONF["repo_dir"]) / ".env"
 
-MAINTENANCE_SOCKET = "/run/fnmusic-ext/maintenance.sock"
+MAINTENANCE_SOCKET = "/run/fnmusic-ext/ipc/maintenance.sock"
+RUNTIME_STATUS = "/run/fnmusic-ext/ipc/runtime.json"
 
 async def _try_maintenance_socket(method: str, path: str, body: dict | None = None) -> dict | JSONResponse | None:
     """Try to call the host maintenance socket directly (for direct-mode access).
@@ -1502,6 +1503,27 @@ def _completion_status_summary() -> dict | None:
     }
 
 
+def _runtime_status() -> dict | None:
+    """读取宿主机代理写的运行态（/run/fnmusic-ext/ipc/runtime.json）。
+
+    文件由 worker 在启动/配置热重载后原子写入（0640、组 APP_GID），容器经只读
+    挂载读取。缺失或不可读时返回 None，前端省略提示。
+    """
+    try:
+        with open(RUNTIME_STATUS, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    owner_match = data.get("owner_match")
+    return {
+        "uid": data.get("uid"),
+        "library_dir": str(data.get("library_dir") or ""),
+        "owner_match": owner_match if isinstance(owner_match, bool) else None,
+    }
+
+
 @app.get("/api/status")
 async def api_status(request: Request):
     values = read_env()
@@ -1574,6 +1596,8 @@ async def api_status(request: Request):
         "lx_source": lx_source,
         # 整曲补全摘要（供概览页卡片直接渲染，不多发一次请求）；账本不可用时为 null
         "completion": await run_in_threadpool(_completion_status_summary),
+        # 代理运行身份与有效落库目录（宿主机 worker 写，只读挂载读取）
+        "runtime": _runtime_status(),
         # 分段健康：进程/HTTP/列表/脚本/播放五层，各层独立结论。
         # lxmusic 的 /healthz 本轮已取到，直接复用避免重复探活拖慢状态接口。
         "health": await _layered_health(

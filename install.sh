@@ -251,7 +251,7 @@ usage() {
 部署形态二选一：--deploy docker（默认，单容器按需加载，需 Docker）或
 --deploy native（原生宿主机 systemd + supervisord，无需 Docker）；
 同机两种形态互斥，切换部署形态请追加 --adopt。核心代理始终在宿主机 systemd 运行。
-密钥只写入仓库根目录 .env（chmod 640，容器组可读），不会进入 systemd 文件或日志。
+密钥只写入仓库根目录 .env（chmod 660，容器组可读写，代理与 WebUI 双方维护），不会进入 systemd 文件或日志。
 EOF
 }
 
@@ -1225,6 +1225,7 @@ if [ -d "${BASE_DIR}/musicbox-data" ] && [ ! -d "${SOURCES_DATA_DIR}" ]; then
     mv "${BASE_DIR}/musicbox-data" "${SOURCES_DATA_DIR}"
 fi
 mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/playlist_tracks" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
+    "${BASE_DIR}/public_playlists_cache" \
     "${SOURCES_DATA_DIR}/cache/netease-musicbox" \
     "${SOURCES_DATA_DIR}/config/netease-musicbox" \
     "${SOURCES_DATA_DIR}/netease-musicbox" \
@@ -1397,7 +1398,7 @@ else
     python3 "${BASE_DIR}/proxy/env_merge.py" \
         --existing /dev/null --desired "${ENV_DESIRED}" \
         --output "${ENV_PATH}" --explicit "${ENV_EXPLICIT}" --quiet
-    log_info "已生成初始配置 ${ENV_PATH} (chmod 640)。API Key 不会出现在日志中。"
+    log_info "已生成初始配置 ${ENV_PATH} (chmod 660)。API Key 不会出现在日志中。"
     log_install "mode=fresh-install version=${FNMUSIC_VERSION}"
 fi
 
@@ -1493,8 +1494,8 @@ PY
 migrate_lx_url_between_modes
 
 rm -f "${ENV_DESIRED}"
-# 容器内 appuser 需按组读取 .env（0600 会让 entrypoint 认为未启用音源）
-chmod 0640 "${ENV_PATH}"
+# 容器内 appuser 需按组读写 .env（0600 会让 entrypoint 认为未启用音源，WebUI 也无法保存配置）
+chmod 0660 "${ENV_PATH}"
 chown ":${APP_GID:-1000}" "${ENV_PATH}" 2>/dev/null || true
 # 锁文件是跨进程同步身份，删除会让旧持锁者与新写入者锁住不同 inode。
 # 不在安装期间清理 .env.lock；备份权限由 WebUI 原子替换独立管理。
@@ -1885,7 +1886,7 @@ lx_verify_and_activate() {
             --explicit "${explicit_keys}" --quiet
         rm -f "${ENV_DESIRED2}"
     fi
-    chmod 0640 "${ENV_PATH}"
+    chmod 0660 "${ENV_PATH}"
     chown ":${APP_GID:-1000}" "${ENV_PATH}" 2>/dev/null || true
     return 0
 }
@@ -1893,7 +1894,7 @@ lx_verify_and_activate() {
 
 
 # Repo-internal directories writable by container/group
-for _d in recommend_cache online_favorites playlist_tracks play_history cache preview_image; do
+for _d in recommend_cache public_playlists_cache online_favorites playlist_tracks play_history cache preview_image; do
     if [ -d "${BASE_DIR}/$_d" ]; then
         chown -R ":${APP_GID:-1000}" "${BASE_DIR}/$_d" 2>/dev/null || true
         chmod 0770 "${BASE_DIR}/$_d" 2>/dev/null || true

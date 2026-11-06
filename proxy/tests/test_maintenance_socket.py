@@ -67,7 +67,7 @@ def test_private_permissions_delegation_and_stop(tmp_path):
         path = directory / "maintenance.sock"
         server = await m.start(loop, callback, path)
         try:
-            assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+            assert stat.S_IMODE(directory.stat().st_mode) == 0o711
             assert stat.S_IMODE(path.stat().st_mode) == 0o660
             status, data = await exchange(path, request())
             assert status == 202 and data["state"] == "real proxy state"
