@@ -1052,14 +1052,6 @@ async function checkActiveConfigJob() {
   } catch (_) {
     // 忽略检查活动任务的非阻断异常
   }
-/* 补全预算若高于首播总上限，会被代理夹紧——保存时给出提示，避免"调大了没生效" */
-function completionBudgetNote(values) {
-  const budget = Number(values && values.FNMUSIC_FALLBACK_TIMEOUT);
-  const cap = Number(values && values.FNMUSIC_STREAM_TOTAL_MAX_S);
-  if (Number.isFinite(budget) && Number.isFinite(cap) && budget > cap) {
-    return `注意：补全搜索预算 ${budget}s 高于首播总时长上限 ${cap}s，实际生效为上限内的剩余额`;
-  }
-  return "";
 }
 
 /* 补全预算若高于首播总上限，会被代理夹紧——保存时给出提示，避免"调大了没生效" */
