@@ -5,6 +5,12 @@
 
 ## [Unreleased]
 
+
+- 管理台修复：整曲补全提交（3a6a05c）新增 `completionBudgetNote` 时误覆盖了
+  `checkActiveConfigJob` 的收尾 `}`，浏览器加载 `app.js` 报
+  `Uncaught SyntaxError: Unexpected end of input`，管理台整页空白/不可用。
+  已补回缺失的 `}`，`node --check` 与静态语法检查通过。
+
 - 安装可靠性修复（3.0.0 fpk 全新安装失败）：应用中心安装后服务启动时子进程报
   `No module named 'anyio._backends'` 并回滚。根因是 venv 刚由 pip 落盘时
   Python 3.11 的 FileFinder 仅按秒级 mtime 判断目录缓存，安装期目录替换会留下
