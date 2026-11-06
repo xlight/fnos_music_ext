@@ -1030,6 +1030,8 @@ async function checkActiveConfigJob() {
   } catch (_) {
     // 忽略检查活动任务的非阻断异常
   }
+}
+
 /* 补全预算若高于首播总上限，会被代理夹紧——保存时给出提示，避免"调大了没生效" */
 function completionBudgetNote(values) {
   const budget = Number(values && values.FNMUSIC_FALLBACK_TIMEOUT);
