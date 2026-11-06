@@ -665,3 +665,7 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
   .about-donate-badge { padding: 1px 8px; font-size: 12px; margin-right: 4px; }
   .chip { padding: 6px 12px; }
 }
+
+/* 补全记录表格 */
+.data-table { width:100%; border-collapse:collapse; font-size:13px; }
+.data-table th, .data-table td { padding:6px 8px; border-bottom:1px solid var(--line, #eee); text-align:left; }

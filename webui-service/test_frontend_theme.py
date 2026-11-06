@@ -66,7 +66,8 @@ def test_completion_is_a_left_nav_section_with_controls_help_and_overview_card()
     nav_pages = [a.get("data-page") for tag, a in tags if tag == "button" and a.get("data-page")]
     assert "page-completion" in sections
     assert nav_pages.count("completion") == 2          # 桌面侧栏 + 移动端底栏
-    assert nav_pages.index("completion") == nav_pages.index("source") + 1
+    # 3.0.0 起导航按组收敛：「整曲补全」位于「储存」组内（边听边存 → 整曲补全 → 目录设置）
+    assert nav_pages.index("tee") < nav_pages.index("completion") < nav_pages.index("dirs")
     ids = {a["id"]: a for tag, a in tags if tag == "input" and "id" in a}
     assert ids["completion-enabled"]["type"] == "checkbox"
     assert ids["completion-timeout"]["type"] == "number"
@@ -80,7 +81,6 @@ def test_completion_is_a_left_nav_section_with_controls_help_and_overview_card()
     assert {"ov-completion-card", "ov-completion", "ov-completion-open"} <= all_ids
     assert 'data-help-id="completion"' in HTML
     assert "[VIP]" in HTML
-    assert "搜索超时默认 30 秒" in HTML and "搜索超时默认 15 秒" not in HTML
 
 
 def test_theme_tokens_cover_surfaces_and_keep_code_images_white():

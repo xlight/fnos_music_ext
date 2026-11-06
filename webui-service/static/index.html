@@ -409,6 +409,48 @@
         </div>
       </section>
 
+
+      <!-- 储存：整曲补全（配置 + 补全记录） -->
+      <section class="page" id="page-completion">
+        <h2><span>整曲补全</span><button class="help-btn" type="button" data-help="completion" aria-label="整曲补全帮助">?</button></h2>
+        <div class="card">
+          <div class="card-title"><span>整曲补全</span><button class="help-btn" type="button" data-help="completion" aria-label="整曲补全帮助">?</button></div>
+          <label class="switch-row"><span>启用整曲补全（用其它音源补齐不能整曲播放的曲目）</span><input type="checkbox" id="completion-enabled"></label>
+          <p class="hint">仅在账号型音源（网易盒子 / 免扫码）给不出完整曲时生效，需要 musicdl 已启用；默认关闭——换源会改变实际听到的版本。保存后热重载生效。[VIP] 标记不等于放不出来：开启后标 [VIP] 的歌可能由其它音源补全整曲。</p>
+        </div>
+        <div class="card">
+          <label class="field"><span>补全搜索预算（秒）</span>
+            <input class="input" id="completion-timeout" type="number" min="1" max="60" step="any" inputmode="decimal">
+          </label>
+          <label class="field"><span>每源候选条数</span>
+            <input class="input" id="completion-limit" type="number" min="1" max="30" step="1" inputmode="numeric">
+          </label>
+          <label class="field"><span>慢源宽限（秒，0=不等慢源）</span>
+            <input class="input" id="completion-grace" type="number" min="0" max="15" step="any" inputmode="decimal">
+          </label>
+          <label class="field"><span>首播总时长上限（秒）</span>
+            <input class="input" id="completion-total-max" type="number" min="5" max="300" step="any" inputmode="decimal">
+          </label>
+          <p class="hint">补全搜索预算受首播总时长上限约束（超过会被夹紧）；条数越少探活越快，越多越容易超时。保存后约 3 秒内热重载生效。</p>
+        </div>
+        <div class="card">
+          <div class="card-title">
+            <span>补全记录</span>
+            <button class="btn small" id="completion-refresh" type="button">刷新</button>
+          </div>
+          <p class="hint" id="completion-note">最近的整曲补全尝试（命中 / 未命中 / 跳过及原因）。</p>
+          <table class="data-table" id="completion-table" hidden>
+            <thead><tr><th>时间</th><th>曲目 · 歌手</th><th>原音源</th><th>结果（含命中音源）</th><th>耗时</th></tr></thead>
+            <tbody id="completion-tbody"></tbody>
+          </table>
+          <div class="btn-row">
+            <button class="btn small" id="completion-prev">上一页</button>
+            <span id="completion-page" class="muted">1</span>
+            <button class="btn small" id="completion-next">下一页</button>
+          </div>
+        </div>
+      </section>
+
       <!-- 储存：目录设置 -->
       <section class="page" id="page-dirs">
         <div class="page-head">
@@ -665,6 +707,13 @@
   <template data-help-id="lx-order">
     <p>同一音质档位会按这个顺序尝试脚本：可拖动排序，也可用「上移/下移」按钮（键盘同样可用）。</p>
     <p>停用的源保留原位置，重新激活后恢复；删除源会移除它的排序项。若自动切换已关闭，排序会被禁用，但已保存顺序不会清空。</p>
+  </template>
+  <template data-help-id="completion">
+    <p>账号型音源（网易盒子 / 免扫码）拿不到完整曲时——VIP 无权益、版权下架、或上游只给 30s 试听片段——开启后会自动在其它已启用音源里找同名曲目并替换播放（307 跳转，客户端无感知）。需要 musicdl 已启用。</p>
+    <p>默认关闭：换源会改变实际听到的版本（可能是另一个音源的另一个版本），由你主动开启。关闭只影响跨源替换，不会把试听片段当全曲放出来。</p>
+    <p>[VIP] 标记不等于放不出来：开启后标 [VIP] 的歌可能由其它音源补全整曲。</p>
+    <p>四个参数：补全搜索预算（一次跨源搜索给多少秒，受首播总时长上限约束）、每源候选条数（越少探活越快）、慢源宽限（首个源出结果后再等多久）、首播总时长上限（含取链+补全的总墙钟硬上限）。保存后热重载生效。</p>
+    <p>下方「补全记录」列出最近的补全尝试：命中（换到了哪个音源）、未命中、跳过及原因（开关关闭 / 音源未启用 / 冷却中等），概览页也有摘要。</p>
   </template>
   <template data-help-id="direct-play">
     <p><b>是什么：</b>默认在线歌曲由 NAS 代理下载再转发给播放器。开启直连后，本地与缓存都未命中时，NAS 用 <code>302</code> 把音乐平台的原始音频地址直接交给播放器，减轻 NAS 带宽与 CPU。</p>
